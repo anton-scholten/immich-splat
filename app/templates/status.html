@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>immich-splat</title>
+  <style>
+    :root {
+      --bg: #0f1115;
+      --card: #171a21;
+      --border: #262b35;
+      --text: #e6e8eb;
+      --muted: #8b93a1;
+      --accent: #6ea8fe;
+      --ok: #4caf7d;
+      --warn: #e0b04f;
+      --err: #e05f5f;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      padding: 2rem 1.5rem 4rem;
+    }
+    header {
+      max-width: 900px;
+      margin: 0 auto 2rem;
+    }
+    h1 { font-size: 1.4rem; margin: 0 0 0.25rem; }
+    p.sub { color: var(--muted); margin: 0; font-size: 0.9rem; }
+    .grid {
+      max-width: 900px;
+      margin: 0 auto;
+      display: grid;
+      gap: 0.75rem;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 1rem;
+      display: grid;
+      grid-template-columns: 64px 1fr auto;
+      gap: 1rem;
+      align-items: center;
+    }
+    .thumb {
+      width: 64px;
+      height: 64px;
+      border-radius: 8px;
+      object-fit: cover;
+      background: #000;
+    }
+    .meta { min-width: 0; }
+    .job-id { font-size: 0.75rem; color: var(--muted); font-family: ui-monospace, monospace; }
+    .badge {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.2rem 0.55rem;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.03em;
+    }
+    .badge.queued { background: rgba(224,176,79,0.15); color: var(--warn); }
+    .badge.processing { background: rgba(110,168,254,0.15); color: var(--accent); }
+    .badge.done { background: rgba(76,175,125,0.15); color: var(--ok); }
+    .badge.error { background: rgba(224,95,95,0.15); color: var(--err); }
+    a.view {
+      background: var(--accent);
+      color: #0f1115;
+      font-weight: 600;
+      text-decoration: none;
+      padding: 0.5rem 0.9rem;
+      border-radius: 8px;
+      font-size: 0.9rem;
+      white-space: nowrap;
+    }
+    .empty { color: var(--muted); text-align: center; padding: 3rem 0; }
+    .err-msg { color: var(--err); font-size: 0.8rem; margin-top: 0.25rem; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>immich-splat</h1>
+    <p class="sub">Photos sent from Immich, converted to Gaussian splats with Apple's ml-sharp.</p>
+  </header>
+  <div class="grid" id="jobs">
+    <div class="empty">Loading…</div>
+  </div>
+
+  <script>
+    function badgeClass(status) {
+      return { queued: "queued", processing: "processing", done: "done", error: "error" }[status] || "queued";
+    }
+
+    async function refresh() {
+      let jobs;
+      try {
+        const res = await fetch("/api/jobs");
+        jobs = await res.json();
+      } catch (e) {
+        return; // keep showing last known state on transient errors
+      }
+
+      const container = document.getElementById("jobs");
+      if (!jobs.length) {
+        container.innerHTML = '<div class="empty">No jobs yet. Add a photo to your splat album/tag in Immich to get started.</div>';
+        return;
+      }
+
+      container.innerHTML = jobs.map(j => {
+        const status = j.status || "queued";
+        const thumb = j.thumb_url ? `<img class="thumb" src="${j.thumb_url}" />` : `<div class="thumb"></div>`;
+        const action = status === "done"
+          ? `<a class="view" href="${j.viewer_url}">View Splat</a>`
+          : `<span class="badge ${badgeClass(status)}">${status}</span>`;
+        const errMsg = status === "error" && j.error ? `<div class="err-msg">${escapeHtml(j.error)}</div>` : "";
+        return `
+          <div class="card">
+            ${thumb}
+            <div class="meta">
+              <div class="job-id">${j.id}</div>
+              <div>${status === "done" ? '<span class="badge done">done</span>' : ""}</div>
+              ${errMsg}
+            </div>
+            ${action}
+          </div>
+        `;
+      }).join("");
+    }
+
+    function escapeHtml(s) {
+      const div = document.createElement("div");
+      div.textContent = s;
+      return div.innerHTML;
+    }
+
+    refresh();
+    setInterval(refresh, 3000);
+  </script>
+</body>
+</html>

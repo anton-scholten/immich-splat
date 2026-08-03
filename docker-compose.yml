@@ -1,0 +1,38 @@
+services:
+  app:
+    build: ./app
+    container_name: immich-splat-app
+    ports:
+      - "8080:8080"
+    volumes:
+      - splat_data:/data
+    environment:
+      IMMICH_URL: ${IMMICH_URL}
+      IMMICH_API_KEY: ${IMMICH_API_KEY}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+    restart: unless-stopped
+
+  worker:
+    build: ./worker
+    container_name: immich-splat-worker
+    volumes:
+      - splat_data:/data
+      - model_cache:/root/.cache
+    environment:
+      POLL_INTERVAL: 3
+      SHARP_TIMEOUT_SECONDS: 900
+    restart: unless-stopped
+    # Requires the NVIDIA Container Toolkit installed on the host:
+    # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+volumes:
+  splat_data:
+  model_cache:
