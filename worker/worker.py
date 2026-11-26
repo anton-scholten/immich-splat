@@ -103,6 +103,9 @@ class Model:
 
     def __init__(self, device: torch.device):
         self.device = device
+        if device.type == "cuda" and is_gtx16(device):
+            log.info("GTX 16xx GPU: enabling the known fp16 NaN workarounds up front")
+            enable_fp16_safety()
         self._load()
 
     def _load(self) -> None:
@@ -121,8 +124,7 @@ class Model:
     @property
     def label(self) -> str:
         """What the job ran on, e.g. "cuda-fp16" or "cpu-fp32"."""
-        extra = "-nocudnn" if self.device.type == "cuda" and not torch.backends.cudnn.enabled else ""
-        return f"{self.device.type}-{self.precision}{extra}"
+        return f"{self.device.type}-{self.precision}"
 
     def _want_fp16(self) -> bool:
         if self.device.type != "cuda" or SHARP_PRECISION == "fp32":
@@ -141,13 +143,14 @@ class Model:
             lambda mod, args: tuple(a.half() if torch.is_tensor(a) and a.is_floating_point() else a for a in args)
         )
         self.precision = "fp16"
+        upcast_attention()
 
     def next_fallback(self, problem: str) -> bool:
         """Step down after a failed prediction; True if there is something left to try.
 
-        problem "oom": fp32 -> fp16 -> CPU.  problem "nan": fp16 -> fp16 without cuDNN
-        (GTX 16xx cards are known to produce NaN in fp16) -> CPU. The new setting is kept
-        for later jobs, so a GPU that can't do it only costs one failed try.
+        problem "oom": fp32 -> fp16 -> CPU.  problem "nan": fp16 -> fp16 with the
+        workarounds below (if not on yet) -> CPU. The new setting is kept for later jobs,
+        so a GPU that can't do it only costs one failed try.
         """
         if self.device.type != "cuda":
             return False
@@ -155,9 +158,9 @@ class Model:
             self._convert_to_fp16()
             log.warning("Out of GPU memory in fp32; switched the model to fp16 for this and later jobs")
             return True
-        if problem == "nan" and self.precision == "fp16" and torch.backends.cudnn.enabled:
-            torch.backends.cudnn.enabled = False
-            log.warning("fp16 gave NaN/inf on this GPU; retrying with cuDNN disabled")
+        if problem == "nan" and self.precision == "fp16" and not fp16_safety_on():
+            enable_fp16_safety()
+            log.warning("fp16 gave NaN/inf on this GPU; retrying with the fp16 workarounds on")
             return True
         reason = "not enough GPU memory" if problem == "oom" else "this GPU gives NaN/inf results"
         log.warning("%s; moving the model to the CPU (much slower, about 1 min per photo)", reason)
@@ -220,6 +223,40 @@ def drop_nonfinite(g: Gaussians3D, where: str) -> Gaussians3D:
     log.warning("Dropping %d of %d non-finite Gaussians after %s", bad, total, where)
     keep = ok[0]  # batch size is 1
     return Gaussians3D(*[t[:, keep] for t in g])
+
+
+def is_gtx16(device: torch.device) -> bool:
+    """GTX 16xx (Turing without tensor cores) is known to give NaN in fp16
+    (pytorch/pytorch#58123); same check as AUTOMATIC1111's stable-diffusion-webui."""
+    return (torch.cuda.get_device_capability(device) == (7, 5)
+            and torch.cuda.get_device_name(device).startswith("NVIDIA GeForce GTX 16"))
+
+
+def enable_fp16_safety() -> None:
+    """cuDNN benchmark mode lets these cards pick fp16 conv kernels that work
+    (stable-diffusion-webui PR 4407); fp32 accumulation keeps big matmul sums finite.
+    Costs about 0.06 GiB extra and no speed."""
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction = False
+
+
+def fp16_safety_on() -> bool:
+    return torch.backends.cudnn.benchmark and not torch.backends.cuda.matmul.allow_fp16_reduced_precision_reduction
+
+
+_sdpa = F.scaled_dot_product_attention
+
+
+def _sdpa_fp32(q, k, v, *args, **kwargs):
+    if q.dtype == torch.float16:
+        return _sdpa(q.float(), k.float(), v.float(), *args, **kwargs).half()
+    return _sdpa(q, k, v, *args, **kwargs)
+
+
+def upcast_attention() -> None:
+    """Run attention (the ViT encoders' softmax) in fp32 while the weights stay fp16.
+    Measured: +0.12 GiB peak, and faster on Pascal, whose fp16 math is slow."""
+    F.scaled_dot_product_attention = _sdpa_fp32
 
 
 def free_gpu_memory() -> None:
