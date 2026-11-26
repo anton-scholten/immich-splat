@@ -56,6 +56,18 @@ Edit `.env`:
 
 Compose refuses to start if `IMMICH_URL`, `IMMICH_API_KEY` or `WEBHOOK_SECRET` is empty.
 
+**Keep your secrets out of git.** `.env`, any other `*.env`, personal
+`docker-compose.override.yml` files and key files are git-ignored. If you contribute,
+also enable the repo's pre-commit hook once per clone; it blocks commits that add
+those files or lines that look like real keys:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+A GitHub Actions check (`.github/workflows/secret-scan.yml`) runs gitleaks over the
+full history on every push and pull request.
+
 ## 3. Build and start
 
 ```bash

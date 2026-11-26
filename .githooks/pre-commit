@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Blocks commits that would add secrets or personal config.
+# Enable once per clone:  git config core.hooksPath .githooks
+set -euo pipefail
+
+fail=0
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+
+# 1. Forbidden files (real .env files, personal compose overrides, keys).
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    base=$(basename "$f")
+    case "$base" in
+        .env.example) ;;
+        .env|.env.*|*.env|*.pem|*.key|*.p12|*.pfx|\
+        docker-compose.override.y*ml|compose.override.y*ml|docker-compose.local.yml|docker-compose.*.local.yml)
+            echo "pre-commit: refusing to commit '$f' (secrets or personal config)." >&2
+            fail=1 ;;
+    esac
+done <<< "$staged"
+
+# 2. Secret values in added lines (any file).
+pattern='^\+.*((IMMICH_API_KEY|WEBHOOK_SECRET)[[:space:]]*[=:][[:space:]]*["'"'"']?[A-Za-z0-9_+/=-]{8,}|x-api-key[[:space:]]*[:=][[:space:]]*["'"'"']?[A-Za-z0-9_+/=-]{16,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+if [ -n "$staged" ]; then
+    hits=$(git diff --cached -U0 -- $staged | grep -E "$pattern" | grep -v -E '\$\{|<[a-z_-]+>|example|change-me' || true)
+    if [ -n "$hits" ]; then
+        echo "pre-commit: these added lines look like real secrets:" >&2
+        echo "$hits" | sed 's/^/  /' >&2
+        fail=1
+    fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "Commit blocked. Keep real values in .env (git-ignored). Bypass only if sure: git commit --no-verify" >&2
+    exit 1
+fi

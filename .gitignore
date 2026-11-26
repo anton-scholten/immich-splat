@@ -1,0 +1,40 @@
+# --- Secrets and personal config: never commit these -------------------------
+# Real settings (API key, webhook secret, URLs). Only .env.example is tracked.
+.env
+.env.*
+*.env
+!.env.example
+
+# Personal Docker Compose overrides (host paths, GPU device mounts, networks)
+docker-compose.override.yml
+docker-compose.override.yaml
+compose.override.yml
+compose.override.yaml
+docker-compose.local.yml
+docker-compose.*.local.yml
+
+# Keys and certificates (e.g. for a reverse proxy)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+secrets/
+
+# --- Runtime data: photos and splats belong in the Docker volume ------------
+data/
+cache/
+*.ply
+*.spz
+*.sog
+
+# --- Tooling --------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+node_modules/
+.vscode/
+.idea/
+.DS_Store
