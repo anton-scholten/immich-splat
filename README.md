@@ -1,212 +1,70 @@
 # immich-splat
 
-Tag a photo in Immich and get a 3D Gaussian splat of it, viewable in the browser.
-The stack downloads the photo, runs Apple's [ml-sharp](https://github.com/apple/ml-sharp)
-(SHARP) to build the splat, and serves it in a self-hosted
-[SuperSplat viewer](https://github.com/playcanvas/supersplat-viewer) with the camera
-placed where your original photo was taken.
+Tag a photo `splat` in Immich and get a 3D Gaussian splat of it in your browser,
+made by Apple's [ml-sharp](https://github.com/apple/ml-sharp) and shown in the
+[SuperSplat viewer](https://github.com/playcanvas/supersplat-viewer).
 
 ```
-Immich: tag "splat" added to asset
-   │  Workflow: Asset tagged → Filter by tags = splat → Trigger Webhook
-   │  POST (X-Webhook-Secret header)
-   ▼
-app (FastAPI) ──downloads original from Immich API──▶ /data/incoming/<job>/
-   │  writes /data/jobs/<job>.json (status: queued) and /data/thumbs/<job>.jpg
-   ▼
-worker (GPU) ──polls /data/jobs── runs ml-sharp (model kept loaded in memory)
-   │  writes /data/splats/<job>/scene.spz + settings.json
-   │  job status: done
-   ▼
-app gallery (/) ──▶ SuperSplat viewer (scene.spz, per-job camera)
+Immich: tag "splat" → workflow webhook → app (downloads photo) → worker (GPU) → gallery → viewer
 ```
 
 ## Requirements
 
-- Docker with Compose v2
-- Immich **v3.0.0 or later** (Workflows; still a preview feature in Immich)
-- An NVIDIA GPU on the Docker host with the
+- Docker with Compose v2, on the same machine/Docker network as Immich
+- Immich **v3.0.0+** (Workflows, still a preview feature)
+- NVIDIA GPU with **4 GB VRAM minimum (6 GB recommended)**, driver 525+, and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
-  (CPU fallback: see GPU notes)
-- This stack must share a Docker network with your Immich server (see step 2)
+- About 15 GB disk for the images and model
 
-## 1. Create an Immich API key
+| GPU VRAM | Works? |
+|---|---|
+| 10 GB+ | Yes, full precision (fp32) |
+| 6–8 GB | Yes, half precision (fp16), chosen automatically, same visual result |
+| 4 GB | Only if nothing else uses the GPU (no desktop on it); needs ~3.7 GiB free |
+| less | No; use CPU mode (slow) |
 
-Immich: **Account Settings → API Keys → New API Key**. Grant only
-`asset.download`. Add `asset.view` only if you want RAW or other formats that
-Immich cannot serve as an original (the app then uses Immich's rendered preview).
+## Setup
 
-## 2. Configure
+1. **API key.** Immich → Account Settings → API Keys → New. Permission: `asset.download`
+   (add `asset.view` for RAW files).
+2. **Configure.**
+   ```bash
+   cp .env.example .env
+   ```
+   Fill in `IMMICH_API_KEY` and `WEBHOOK_SECRET` (`openssl rand -hex 32`). Check
+   `IMMICH_URL` and `IMMICH_NETWORK` match your Immich setup. Other options are
+   explained in `.env.example`.
+3. **Start.**
+   ```bash
+   docker compose up -d --build
+   ```
+   The first job downloads the model (~1.2 GB) once.
+4. **Enable tags in Immich.** Account Settings → Features → Tags → Enable (and Sidebar).
+   Then create a tag named `splat` (Tags page → Create tag).
+5. **Create the workflow.** Immich → Workflows → new:
+   - Trigger: *Asset tagged*
+   - Filter: *Filter by tags* = `splat`
+   - Action: *Trigger Webhook*, URL `http://immich-splat-app:8080/webhook/immich`,
+     method `POST`, header `X-Webhook-Secret` = your `WEBHOOK_SECRET`
 
-```bash
-cp .env.example .env
-```
+   The URL always uses port 8080 (container to container). Immich has no
+   "added to album" trigger, so albums can't be used; the tag filter stops other
+   tags from sending photos.
 
-Edit `.env`:
+## Use
 
-- `IMMICH_URL` — default `http://immich-server:2283` works when this stack joins
-  Immich's Docker network and the Immich server container is named `immich-server`.
-  Otherwise use the Immich server's own URL.
-- `IMMICH_API_KEY` — the key from step 1
-- `WEBHOOK_SECRET` — generate with `openssl rand -hex 32`; you reuse it in step 4
-- `IMMICH_NETWORK` — the Docker network Immich runs on (usually `immich_default`)
-- `APP_BIND` — which network address the gallery listens on. The default `127.0.0.1`
-  means **only the Docker machine itself** can open it. To open it from other devices
-  on your network, set `0.0.0.0` (or that machine's LAN IP) — see
-  [Opening the gallery from another device](#opening-the-gallery-from-another-device).
-- `APP_PORT` — host port for the gallery, default `8080`. Change it if that port is
-  already taken; the Immich webhook URL below does not change.
-- `IMMICH_PUBLIC_URL` — optional. The Immich address you open in your browser
-  (e.g. `https://photos.example.com`). Adds "Open in Immich" links to the gallery.
+Tag any photo `splat` (web: select → **Tag**; phone app: select → **Add tags**).
+Open the gallery at `http://<host>:8080`:
 
-Compose refuses to start if `IMMICH_URL`, `IMMICH_API_KEY` or `WEBHOOK_SECRET` is empty.
+- Photos being processed are dimmed with a progress ring; tap a finished one to
+  open it in 3D (it starts on the photo's own view; drag to look around).
+- Sort, filter, retry failed jobs, delete jobs, and see disk/CPU/GPU use.
 
-**Keep your secrets out of git.** `.env`, any other `*.env`, personal
-`docker-compose.override.yml` files and key files are git-ignored. If you contribute,
-also enable the repo's pre-commit hook once per clone; it blocks commits that add
-those files or lines that look like real keys:
+**From other devices:** the gallery listens on `127.0.0.1` only. Set `APP_BIND=0.0.0.0`
+in `.env` and restart (there is no login, so keep it on your home network), or put it
+behind your reverse proxy with HTTPS (needed for VR mode). Change `APP_PORT` if 8080 is taken.
 
-```bash
-git config core.hooksPath .githooks
-```
-
-A GitHub Actions check (`.github/workflows/secret-scan.yml`) runs gitleaks over the
-full history on every push and pull request.
-
-## 3. Build and start
-
-```bash
-docker compose up -d --build
-```
-
-The gallery is at `http://${APP_BIND}:${APP_PORT}` (default `http://127.0.0.1:8080`). The first job the worker runs downloads
-ml-sharp's model checkpoint (~1.2 GB) into the `model_cache` volume; this happens once.
-
-## 4. Wire up Immich
-
-**Turn on tags first.** Immich hides tags until you enable them, per user account:
-in Immich web open **Account Settings → Features → Tags**, switch **Enable** on
-(also switch **Sidebar** on to get a *Tags* page in the left menu), and save.
-The setting is stored on the server, so the phone apps pick it up too.
-
-**Create the tag.** Open **Tags** in the sidebar and choose **Create tag**, name it
-`splat`. (Or select any photo, press `t` or choose **Tag**, type `splat` and create it
-there.) The workflow's tag filter below can only pick a tag that already exists, so
-create it before the workflow. Tags added before the workflow exists send nothing.
-
-Then go to **Workflows** and create a workflow:
-
-- **Trigger:** *Asset tagged*
-- **Filter:** *Filter by tags* = `splat`
-- **Action:** *Trigger Webhook*
-  - URL: `http://immich-splat-app:8080/webhook/immich` (always `8080`: Immich talks to
-    the container directly over the Docker network, not through `APP_PORT`)
-  - Method: `POST`
-  - Header: name `X-Webhook-Secret`, value = your `WEBHOOK_SECRET`
-
-Save and enable the workflow.
-
-Why a tag and not an album: Immich workflows have only four triggers (*Asset created*,
-*Asset metadata extracted*, *Asset OCR extracted*, *Asset tagged*). There is no
-"added to album" trigger, so adding a photo to an album cannot send it. The tag
-filter matters too: without it, every tag added to any photo would send a job.
-
-The URL uses the container name, so Immich's server must be on the same Docker
-network as `immich-splat-app` (the app joins `IMMICH_NETWORK` for this).
-
-## 5. Sending photos
-
-Tagging a photo `splat` in Immich is the only way to send one. Pick your device:
-
-Tags must be turned on for your account first (step 4). Then:
-
-**Immich web** (PC, phone or VR headset browser):
-select the photo(s), choose **Tag** (in the ⋮ menu if it is not shown), then pick `splat`.
-
-**Immich Android and iOS apps:**
-select the photo(s), choose **Add tags**, then pick `splat`.
-(menu names may differ slightly by Immich version)
-
-The job then goes `queued` → `processing` → `done` and appears in the gallery.
-
-## 6. Gallery
-
-Open `http://<host>:<APP_PORT>` (default port `8080`) to see the gallery.
-
-- **Thumbnails** of every photo you sent. Photos still being processed are dimmed
-  with a progress ring. Tap a finished one to open it in the SuperSplat viewer.
-  The viewer opens on the photo's own view; press play for camera motion, and drag
-  to look around.
-- **Sort** by date taken, date added, name, original size, splat size or processing
-  time, ascending or descending. **Filter** by status (all, ready, in progress, failed).
-- **Failed** jobs can be retried or deleted.
-- **Stats bar** shows disk use, host CPU and RAM, GPU load and the worker state.
-
-Jobs can be deleted from the gallery. This removes the job record, its thumbnail,
-its incoming photo and its splat files. Jobs in `processing` cannot be deleted.
-
-### Opening the gallery from another device
-
-With the default `APP_BIND=127.0.0.1` the gallery only answers on the Docker machine
-itself, so another computer, phone or headset gets "can't connect". Pick one:
-
-- **Your home network (simplest).** In `.env` set `APP_BIND=0.0.0.0`, then run
-  `docker compose up -d` and open `http://<docker-machine-ip>:<APP_PORT>`
-  (find the IP with `hostname -I` on that machine). If it still won't connect, allow
-  the port in that machine's firewall, e.g. `sudo ufw allow 8080/tcp`.
-  The gallery has no login, so anyone on that network can see and delete your splats;
-  don't forward this port from your router to the internet.
-- **HTTPS through a reverse proxy (recommended for phones and VR).** If Immich already
-  sits behind Caddy, Nginx Proxy Manager, Traefik or similar, add a site pointing to
-  `http://<docker-machine-ip>:<APP_PORT>` (or to `immich-splat-app:8080` if the proxy
-  shares a Docker network with it). Protect it with the proxy's login if it is
-  reachable from outside. The viewer's VR/AR mode and other phone features need HTTPS.
-
-## Where things live
-
-Everything the stack writes is under `/data` (the `splat_data` volume):
-
-- `/data/incoming/<job_id>/original.*` — downloaded photo (deleted by the worker after success)
-- `/data/jobs/<job_id>.json` — job record and status
-- `/data/thumbs/<job_id>.jpg` — thumbnail for the gallery
-- `/data/splats/<job_id>/scene.spz` — splat for the viewer
-- `/data/splats/<job_id>/scene.ply` — only if `KEEP_PLY=true`
-- `/data/splats/<job_id>/settings.json` — per-job viewer settings (camera)
-- `/data/status/worker.json` — worker heartbeat (state, GPU and CPU load) for the stats bar
-
-The model checkpoint is in `/cache` (the `model_cache` volume).
-
-## GPU notes
-
-- The worker needs the NVIDIA Container Toolkit on the host. The PyTorch wheels
-  bundle their own CUDA runtime, so only the NVIDIA driver is needed on the host. The
-  image uses the CUDA 12.6 wheels (any CUDA 12 driver, 525 or newer; tested with 580),
-  which still support older Pascal GPUs (GTX 10xx, TITAN Xp). For Turing or newer
-  you can build with
-  `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128`.
-- **GPU memory.** The model works at a fixed 1536×1536 size, so VRAM use does not
-  depend on the photo. In fp32 it needs about 7.5 GiB, in fp16 about 4.5 GiB, which
-  fits 6 GB cards. `SHARP_PRECISION=auto` (the default) picks fp32 on GPUs with 10 GiB
-  or more and fp16 below that; if fp32 still runs out of memory, the worker switches to
-  fp16 and retries. Set `SHARP_PRECISION=fp32` or `fp16` to force one. fp16 looks the
-  same in the viewer; on older Pascal cards (GTX 10xx) it is slower, on newer cards it
-  is usually faster. Other programs using the GPU (games, other AI containers) reduce
-  what is free. After each job the worker gives back its cached memory, so at idle it
-  only holds the model (about 1.4 GiB in fp16, 2.6 GiB in fp32).
-- **CPU fallback:** set `SHARP_DEVICE=cpu` in `.env`, and drop the GPU request with a
-  `docker-compose.override.yml` next to `docker-compose.yml` (Compose loads it
-  automatically, and git ignores it). It works, but each photo takes much longer.
-
-  ```yaml
-  services:
-    worker:
-      deploy: !reset {}
-  ```
-
-## Updating
-
-Your settings live in `.env` and any `docker-compose.override.yml`, which git ignores,
-so updating never touches them. From the repo folder:
+## Update
 
 ```bash
 git pull --rebase --autostash
@@ -216,26 +74,24 @@ git pull --rebase --autostash
 docker compose up -d --build
 ```
 
-`--autostash` sets aside any local edits to tracked files, pulls, then puts your edits
-back. If it reports a conflict, fix the files it names and run `git stash drop`
-once you are happy. Your photos, splats and the model cache are in Docker volumes and
-survive the rebuild. To make plain `git pull` always do this:
+Your `.env` and data volumes are kept. `docker image prune` frees old image layers.
 
-```bash
-git config pull.rebase true && git config rebase.autoStash true
-```
+## GPU and CPU options
 
-Unused old image layers can pile up after many updates (the worker image is large);
-`docker image prune` removes the dangling ones.
+- `SHARP_PRECISION=auto` (default) uses fp32 on 10 GB+ GPUs, else fp16, and retries in
+  fp16 if fp32 runs out of memory. Force with `fp32` or `fp16`.
+- For Turing or newer GPUs, `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128`
+  gives newer CUDA wheels; the default (cu126) also supports older Pascal cards.
+- **CPU only:** set `SHARP_DEVICE=cpu` and add a `docker-compose.override.yml`:
+  ```yaml
+  services:
+    worker:
+      deploy: !reset {}
+  ```
 
-## Caveats
+## Notes
 
-- **Preview API.** Immich workflows are preview. Trigger and action names, and the
-  webhook body, may change in later Immich versions. The app parses the body Immich's core
-  plugin sends today: `{type, trigger, data: {asset: {...}}}`.
-- **Model license.** The ml-sharp code is under Apple's license. The released model
-  weights have a separate license (`LICENSE_MODEL` in the
-  [ml-sharp repo](https://github.com/apple/ml-sharp)). Read it before using results
-  beyond personal experimentation.
-- **Viewer version.** The SuperSplat viewer is pinned to v1.44.0 by the `SUPERSPLAT_VIEWER_TAG`
-  build arg in `app/Dockerfile`.
+- Data lives in the `splat_data` volume (`/data`: jobs, thumbnails, splats); the model in `model_cache`.
+- `.env` and override files are git-ignored. Contributors: `git config core.hooksPath .githooks`
+  enables a pre-commit secret check.
+- ml-sharp's model weights have their own license (`LICENSE_MODEL` in its repo).

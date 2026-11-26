@@ -58,6 +58,8 @@ ENV PATH=/opt/venv/bin:$PATH \
     KEEP_PLY=false \
     SHARP_DEVICE=default \
     POLL_INTERVAL=3
+# Less GPU memory fragmentation: fp16 then fits in ~3.4 GiB instead of ~3.6 GiB.
+ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 WORKDIR /worker
 COPY worker.py .

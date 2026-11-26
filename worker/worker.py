@@ -343,7 +343,7 @@ def predict_with_fallback(model: Model, image, f_px: float):
             pass
         free_gpu_memory()
     raise RuntimeError(
-        f"Not enough GPU memory ({gpu_memory_text(model.device)}; needs about 4.5 GiB free "
+        f"Not enough GPU memory ({gpu_memory_text(model.device)}; needs about 3.7 GiB free "
         "in fp16). Close other programs using the GPU, or set SHARP_DEVICE=cpu."
     )
 
