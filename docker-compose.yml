@@ -15,7 +15,8 @@ services:
     container_name: immich-splat-app
     ports:
       # Localhost only by default. Put a reverse proxy with HTTPS in front to expose it.
-      - "${APP_BIND:-127.0.0.1}:8080:8080"
+      # APP_PORT is the port on the host; inside the container the app always uses 8080.
+      - "${APP_BIND:-127.0.0.1}:${APP_PORT:-8080}:8080"
     volumes:
       - splat_data:/data
     environment:

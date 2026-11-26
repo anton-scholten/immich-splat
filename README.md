@@ -51,6 +51,8 @@ Edit `.env`:
 - `WEBHOOK_SECRET` — generate with `openssl rand -hex 32`; you reuse it in step 4
 - `IMMICH_NETWORK` — the Docker network Immich runs on (usually `immich_default`)
 - `APP_BIND` — leave `127.0.0.1` and publish through a reverse proxy, or set another address
+- `APP_PORT` — host port for the gallery, default `8080`. Change it if that port is
+  already taken; the Immich webhook URL below does not change.
 - `IMMICH_PUBLIC_URL` — optional. The Immich address you open in your browser
   (e.g. `https://photos.example.com`). Adds "Open in Immich" links to the gallery.
 
@@ -74,7 +76,7 @@ full history on every push and pull request.
 docker compose up -d --build
 ```
 
-The app listens on `${APP_BIND}:8080`. The first job the worker runs downloads
+The gallery is at `http://${APP_BIND}:${APP_PORT}` (default `http://127.0.0.1:8080`). The first job the worker runs downloads
 ml-sharp's model checkpoint (~1.2 GB) into the `model_cache` volume; this happens once.
 
 ## 4. Wire up Immich
@@ -84,7 +86,8 @@ In Immich, first create a tag (e.g. `splat`). Then go to **Workflows** and creat
 - **Trigger:** *Asset tagged*
 - **Filter:** *Filter by tags* = `splat`
 - **Action:** *Trigger Webhook*
-  - URL: `http://immich-splat-app:8080/webhook/immich`
+  - URL: `http://immich-splat-app:8080/webhook/immich` (always `8080`: Immich talks to
+    the container directly over the Docker network, not through `APP_PORT`)
   - Method: `POST`
   - Header: name `X-Webhook-Secret`, value = your `WEBHOOK_SECRET`
 
@@ -114,7 +117,7 @@ The job then goes `queued` → `processing` → `done` and appears in the galler
 
 ## 6. Gallery
 
-Open `http://<host>:8080` to see the gallery.
+Open `http://<host>:<APP_PORT>` (default port `8080`) to see the gallery.
 
 - **Thumbnails** of every photo you sent. Photos still being processed are dimmed
   with a progress ring. Tap a finished one to open it in the SuperSplat viewer.
@@ -153,8 +156,40 @@ The model checkpoint is in `/cache` (the `model_cache` volume).
   which still support older Pascal GPUs (GTX 10xx, TITAN Xp). For Turing or newer
   you can build with
   `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128`.
-- **CPU fallback:** set `SHARP_DEVICE=cpu`, and remove the `deploy:` block from the
-  `worker` service in `docker-compose.yml`. It works, but each photo takes much longer.
+- **CPU fallback:** set `SHARP_DEVICE=cpu` in `.env`, and drop the GPU request with a
+  `docker-compose.override.yml` next to `docker-compose.yml` (Compose loads it
+  automatically, and git ignores it). It works, but each photo takes much longer.
+
+  ```yaml
+  services:
+    worker:
+      deploy: !reset {}
+  ```
+
+## Updating
+
+Your settings live in `.env` and any `docker-compose.override.yml`, which git ignores,
+so updating never touches them. From the repo folder:
+
+```bash
+git pull --rebase --autostash
+```
+
+```bash
+docker compose up -d --build
+```
+
+`--autostash` sets aside any local edits to tracked files, pulls, then puts your edits
+back. If it reports a conflict, fix the files it names and run `git stash drop`
+once you are happy. Your photos, splats and the model cache are in Docker volumes and
+survive the rebuild. To make plain `git pull` always do this:
+
+```bash
+git config pull.rebase true && git config rebase.autoStash true
+```
+
+Unused old image layers can pile up after many updates (the worker image is large);
+`docker image prune` removes the dangling ones.
 
 ## Caveats
 
