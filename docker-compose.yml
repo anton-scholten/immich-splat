@@ -1,27 +1,46 @@
+x-hardening: &hardening
+  user: "1000:1000"
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+
 services:
   app:
+    <<: *hardening
     build: ./app
     container_name: immich-splat-app
     ports:
-      - "8080:8080"
+      # Localhost only by default. Put a reverse proxy with HTTPS in front to expose it.
+      - "${APP_BIND:-127.0.0.1}:8080:8080"
     volumes:
       - splat_data:/data
     environment:
-      IMMICH_URL: ${IMMICH_URL}
-      IMMICH_API_KEY: ${IMMICH_API_KEY}
-      WEBHOOK_SECRET: ${WEBHOOK_SECRET}
-      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      IMMICH_URL: ${IMMICH_URL:?set IMMICH_URL in .env}
+      IMMICH_API_KEY: ${IMMICH_API_KEY:?set IMMICH_API_KEY in .env}
+      WEBHOOK_SECRET: ${WEBHOOK_SECRET:?set WEBHOOK_SECRET in .env (openssl rand -hex 32)}
+    networks:
+      - default
+      - immich
     restart: unless-stopped
 
   worker:
+    <<: *hardening
     build: ./worker
     container_name: immich-splat-worker
     volumes:
       - splat_data:/data
-      - model_cache:/root/.cache
+      - model_cache:/cache
     environment:
-      POLL_INTERVAL: 3
-      SHARP_TIMEOUT_SECONDS: 900
+      POLL_INTERVAL: ${POLL_INTERVAL:-3}
+      KEEP_PLY: ${KEEP_PLY:-false}
+      SHARP_DEVICE: ${SHARP_DEVICE:-default}
+    # Default network only (outbound internet for the first model download).
+    networks:
+      - default
     restart: unless-stopped
     # Requires the NVIDIA Container Toolkit installed on the host:
     # https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html
@@ -32,6 +51,11 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+networks:
+  immich:
+    name: ${IMMICH_NETWORK:-immich_default}
+    external: true
 
 volumes:
   splat_data:
