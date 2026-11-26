@@ -170,6 +170,12 @@
         <option value="failed">Failed</option>
       </select>
     </label>
+    <label>Open in
+      <select id="open" class="ctl" aria-label="Open splats in">
+        <option value="same">Same tab</option>
+        <option value="new">New tab</option>
+      </select>
+    </label>
     <span class="offline-note" id="conn" role="status">Connection lost, retrying...</span>
     <span id="count" aria-live="polite"></span>
   </div>
@@ -199,7 +205,7 @@ var tiles = new Map();       // job id -> tile state (keyed DOM node)
 var system = null;
 var worker = {};             // last online worker.json
 var skew = 0;                // server clock minus client clock, ms
-var prefs = {sort: "taken", dir: "desc", filter: "all"};
+var prefs = {sort: "taken", dir: "desc", filter: "all", open: "same"};
 try { Object.assign(prefs, JSON.parse(localStorage.getItem("splat.prefs") || "{}")); } catch (e) {}
 
 var $ = function (id) { return document.getElementById(id); };
@@ -504,7 +510,7 @@ document.addEventListener("keydown", function (e) { if (e.key === "Escape") clos
 
 function onOpen(j) {
   if (!j) return;
-  if (j.status === "done" && j.viewer_url) location.href = j.viewer_url;
+  if (j.status === "done" && j.viewer_url) openViewer(j.viewer_url);
   else if (j.status === "error") onMenu(j);
   else toast("Still processing");
 }
@@ -522,7 +528,7 @@ function onMenu(j) {
   if (!j) return;
   var name = j.original_filename || j.id;
   var btns = [];
-  if (j.status === "done" && j.viewer_url) btns.push({label: "Open viewer", cls: "primary", run: function () { location.href = j.viewer_url; }});
+  if (j.status === "done" && j.viewer_url) btns.push({label: "Open viewer", cls: "primary", run: function () { openViewer(j.viewer_url); }});
   if (j.status === "error") btns.push({label: "Retry", cls: "primary", run: async function () {
     try { await api("POST", "/api/jobs/" + encodeURIComponent(j.id) + "/retry"); closeSheet(); toast("Retrying"); poll(); }
     catch (e) { toast("Retry failed: " + e.message); }
@@ -546,19 +552,25 @@ function onMenu(j) {
 }
 
 /* ---------- toolbar ---------- */
+function openViewer(url) {
+  if (prefs.open === "new") window.open(url, "_blank", "noopener");
+  else location.href = url;
+}
 function savePrefs() { try { localStorage.setItem("splat.prefs", JSON.stringify(prefs)); } catch (e) {} }
 function syncToolbar() {
-  $("sort").value = prefs.sort; $("filter").value = prefs.filter;
+  $("sort").value = prefs.sort; $("filter").value = prefs.filter; $("open").value = prefs.open;
   var d = $("dir");
   d.textContent = prefs.dir === "asc" ? "↑ Ascending" : "↓ Descending";
   d.setAttribute("aria-label", "Sort direction: " + (prefs.dir === "asc" ? "ascending" : "descending") + ". Activate to toggle.");
 }
 $("sort").addEventListener("change", function () { prefs.sort = this.value; savePrefs(); render(); });
 $("filter").addEventListener("change", function () { prefs.filter = this.value; savePrefs(); render(); });
+$("open").addEventListener("change", function () { prefs.open = this.value; savePrefs(); });
 $("dir").addEventListener("click", function () { prefs.dir = prefs.dir === "asc" ? "desc" : "asc"; savePrefs(); syncToolbar(); render(); });
 if (!$("sort").querySelector('option[value="' + prefs.sort + '"]')) prefs.sort = "taken";
 if (!$("filter").querySelector('option[value="' + prefs.filter + '"]')) prefs.filter = "all";
 if (prefs.dir !== "asc") prefs.dir = "desc";
+if (prefs.open !== "new") prefs.open = "same";
 syncToolbar();
 
 /* ---------- polling ---------- */
