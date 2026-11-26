@@ -50,7 +50,10 @@ Edit `.env`:
 - `IMMICH_API_KEY` — the key from step 1
 - `WEBHOOK_SECRET` — generate with `openssl rand -hex 32`; you reuse it in step 4
 - `IMMICH_NETWORK` — the Docker network Immich runs on (usually `immich_default`)
-- `APP_BIND` — leave `127.0.0.1` and publish through a reverse proxy, or set another address
+- `APP_BIND` — which network address the gallery listens on. The default `127.0.0.1`
+  means **only the Docker machine itself** can open it. To open it from other devices
+  on your network, set `0.0.0.0` (or that machine's LAN IP) — see
+  [Opening the gallery from another device](#opening-the-gallery-from-another-device).
 - `APP_PORT` — host port for the gallery, default `8080`. Change it if that port is
   already taken; the Immich webhook URL below does not change.
 - `IMMICH_PUBLIC_URL` — optional. The Immich address you open in your browser
@@ -142,8 +145,22 @@ Open `http://<host>:<APP_PORT>` (default port `8080`) to see the gallery.
 Jobs can be deleted from the gallery. This removes the job record, its thumbnail,
 its incoming photo and its splat files. Jobs in `processing` cannot be deleted.
 
-Use HTTPS through a reverse proxy to view it from a phone or VR headset. WebXR and
-other phone/VR features need a secure context.
+### Opening the gallery from another device
+
+With the default `APP_BIND=127.0.0.1` the gallery only answers on the Docker machine
+itself, so another computer, phone or headset gets "can't connect". Pick one:
+
+- **Your home network (simplest).** In `.env` set `APP_BIND=0.0.0.0`, then run
+  `docker compose up -d` and open `http://<docker-machine-ip>:<APP_PORT>`
+  (find the IP with `hostname -I` on that machine). If it still won't connect, allow
+  the port in that machine's firewall, e.g. `sudo ufw allow 8080/tcp`.
+  The gallery has no login, so anyone on that network can see and delete your splats;
+  don't forward this port from your router to the internet.
+- **HTTPS through a reverse proxy (recommended for phones and VR).** If Immich already
+  sits behind Caddy, Nginx Proxy Manager, Traefik or similar, add a site pointing to
+  `http://<docker-machine-ip>:<APP_PORT>` (or to `immich-splat-app:8080` if the proxy
+  shares a Docker network with it). Protect it with the proxy's login if it is
+  reachable from outside. The viewer's VR/AR mode and other phone features need HTTPS.
 
 ## Where things live
 
