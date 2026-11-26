@@ -83,7 +83,7 @@ Your `.env` and data volumes are kept. `docker image prune` frees old image laye
 - If a photo fails on the GPU (out of memory, or NaN results as some GTX 16xx cards give
   in fp16), the worker steps down by itself: fp32 → fp16 → fp16 without cuDNN → CPU
   (about 1 min per photo, ~8 GB RAM), and keeps that setting for later photos.
-  The gallery job shows what it ran on.
+  Each job's `precision` field in `/api/jobs` shows what it ran on.
 - For Turing or newer GPUs, `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128`
   gives newer CUDA wheels; the default (cu126) also supports older Pascal cards.
 - **CPU only:** set `SHARP_DEVICE=cpu` and add a `docker-compose.override.yml`:
