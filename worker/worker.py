@@ -47,7 +47,7 @@ CACHE_DIR = Path("/cache")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
 KEEP_PLY = os.environ.get("KEEP_PLY", "false").lower() in ("1", "true", "yes")
 SHARP_DEVICE = os.environ.get("SHARP_DEVICE", "default")
-SHARP_PRECISION = os.environ.get("SHARP_PRECISION", "auto").lower()  # auto | fp32 | fp16
+SHARP_PRECISION = os.environ.get("SHARP_PRECISION", "auto").lower()  # auto | fp32 | fp32-offload | fp16
 SPLAT_TRANSFORM_TIMEOUT = 600
 HEARTBEAT_INTERVAL = 2
 STAGES = ("loading", "predicting", "saving", "converting")
@@ -93,83 +93,92 @@ def jobs_with_status(status: str) -> list[dict]:
 
 
 GIB = 1024**3
-# Measured on ml-sharp at its fixed 1536x1536 input: fp32 weights 2.6 GiB, peak 7.5 GiB;
-# fp16 weights 1.4 GiB, peak 4.3 GiB. Below this much VRAM, start in fp16.
+# Measured with ml-sharp's fixed 1536x1536 input (PyTorch memory, plus ~0.25 GiB CUDA overhead):
+#   fp32          weights 2.6 GiB, peak 7.5 GiB    fastest
+#   fp32-offload  weights 0.2 GiB, needs ~4.2 GiB  the two ViT encoders (650M of 700M params)
+#                 stay in RAM and are copied in only while they run; ~10% slower
+#   fp16          weights 1.4 GiB, needs ~3.4 GiB  last GPU option; NaN on GTX 16xx
+MODES = ("fp32", "fp32-offload", "fp16", "cpu")
 FP32_MIN_VRAM = 10 * GIB
+OFFLOAD_MIN_VRAM = 4.6 * GIB
 
 
 class Model:
-    """The ml-sharp predictor plus the precision it currently runs in."""
+    """The ml-sharp predictor and the mode it runs in (see MODES)."""
 
     def __init__(self, device: torch.device):
         self.device = device
-        if device.type == "cuda" and is_gtx16(device):
-            log.info("GTX 16xx GPU: enabling the known fp16 NaN workarounds up front")
-            enable_fp16_safety()
+        self.mode = self._initial_mode()
+        self.tried: set[str] = set()
         self._load()
 
-    def _load(self) -> None:
-        log.info("Loading model (downloads ~1.2GB on first run into %s)", os.environ.get("TORCH_HOME"))
-        state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=False)
-        self.predictor = create_predictor(PredictorParams())
-        self.predictor.load_state_dict(state_dict)
-        del state_dict
-        self.predictor.eval()
-        self.precision = "fp32"
-        if self._want_fp16():
-            self._convert_to_fp16()  # convert on the CPU so the fp32 copy never hits the GPU
-        self.predictor.to(self.device)
-        log.info("Model on %s in %s", self.device, self.precision)
+    def _initial_mode(self) -> str:
+        if self.device.type != "cuda":
+            return "cpu"
+        if SHARP_PRECISION in MODES[:3]:
+            return SHARP_PRECISION
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        mode = "fp32" if total >= FP32_MIN_VRAM else "fp32-offload" if total >= OFFLOAD_MIN_VRAM else "fp16"
+        log.info("GPU has %.1f GiB; starting in %s (override with SHARP_PRECISION)", total / GIB, mode)
+        return mode
 
     @property
     def label(self) -> str:
-        """What the job ran on, e.g. "cuda-fp16" or "cpu-fp32"."""
-        return f"{self.device.type}-{self.precision}"
+        """What the job ran on, e.g. "cuda-fp32-offload" or "cpu"."""
+        return "cpu-fp32" if self.mode == "cpu" else f"cuda-{self.mode}"
 
-    def _want_fp16(self) -> bool:
-        if self.device.type != "cuda" or SHARP_PRECISION == "fp32":
-            return False
-        if SHARP_PRECISION == "fp16":
-            return True
-        total = torch.cuda.get_device_properties(self.device).total_memory
-        if total < FP32_MIN_VRAM:
-            log.info("GPU has %.1f GiB; using fp16 to fit (set SHARP_PRECISION=fp32 to force)", total / GIB)
-            return True
-        return False
-
-    def _convert_to_fp16(self) -> None:
-        self.predictor.half()
-        self.predictor.register_forward_pre_hook(
-            lambda mod, args: tuple(a.half() if torch.is_tensor(a) and a.is_floating_point() else a for a in args)
-        )
-        self.precision = "fp16"
-        upcast_attention()
+    def _load(self) -> None:
+        self.predictor = None
+        free_gpu_memory()
+        log.info("Loading model (downloads ~1.2GB on first run into %s)", os.environ.get("TORCH_HOME"))
+        state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=False)
+        predictor = create_predictor(PredictorParams())
+        predictor.load_state_dict(state_dict)
+        del state_dict
+        predictor.eval()
+        if self.mode == "cpu":
+            self.device = torch.device("cpu")
+            with state_lock:
+                status["device"] = "cpu"
+        elif self.mode == "fp16":
+            if is_gtx16(self.device):
+                log.info("GTX 16xx GPU: enabling the known fp16 NaN workarounds")
+                enable_fp16_safety()
+            predictor.half()  # on the CPU, so the fp32 copy never hits the GPU
+            predictor.register_forward_pre_hook(
+                lambda mod, args: tuple(a.half() if torch.is_tensor(a) and a.is_floating_point() else a for a in args)
+            )
+            upcast_attention()
+        elif self.mode == "fp32-offload":
+            enc = predictor.monodepth_model.monodepth_predictor.encoder
+            for vit in (enc.patch_encoder, enc.image_encoder):
+                offload_to_ram(vit, self.device)
+        predictor.to(self.device)  # offloaded parts ignore this: their hooks keep them in RAM
+        self.predictor = predictor
+        self.tried.add(self.mode)
+        log.info("Model ready: %s", self.label)
 
     def next_fallback(self, problem: str) -> bool:
-        """Step down after a failed prediction; True if there is something left to try.
+        """Pick the next mode after a failed prediction; True if there is one to try.
 
-        problem "oom": fp32 -> fp16 -> CPU.  problem "nan": fp16 -> fp16 with the
-        workarounds below (if not on yet) -> CPU. The new setting is kept for later jobs,
-        so a GPU that can't do it only costs one failed try.
+        "oom": move one step down MODES.  "nan" in fp16: first retry with the fp16
+        workarounds, then fp32-offload (if not yet tried), then CPU. The new mode is kept
+        for later jobs, so a GPU that can't do it only costs one failed try.
         """
-        if self.device.type != "cuda":
+        if self.mode == "cpu":
             return False
-        if problem == "oom" and self.precision == "fp32":
-            self._convert_to_fp16()
-            log.warning("Out of GPU memory in fp32; switched the model to fp16 for this and later jobs")
-            return True
-        if problem == "nan" and self.precision == "fp16" and not fp16_safety_on():
+        if problem == "nan" and self.mode == "fp16" and not fp16_safety_on():
             enable_fp16_safety()
             log.warning("fp16 gave NaN/inf on this GPU; retrying with the fp16 workarounds on")
             return True
-        reason = "not enough GPU memory" if problem == "oom" else "this GPU gives NaN/inf results"
-        log.warning("%s; moving the model to the CPU (much slower, about 1 min per photo)", reason)
-        self.predictor = None
-        free_gpu_memory()
-        self.device = torch.device("cpu")
+        if problem == "oom":
+            nxt = MODES[MODES.index(self.mode) + 1]
+        else:
+            nxt = next((m for m in ("fp32-offload", "cpu") if m not in self.tried), "cpu")
+        reason = "not enough GPU memory" if problem == "oom" else "NaN/inf results"
+        log.warning("%s in %s; switching to %s for this and later photos", reason, self.mode, nxt)
+        self.mode = nxt
         self._load()
-        with state_lock:
-            status["device"] = "cpu"
         return True
 
     @torch.no_grad()
@@ -257,6 +266,33 @@ def upcast_attention() -> None:
     """Run attention (the ViT encoders' softmax) in fp32 while the weights stay fp16.
     Measured: +0.12 GiB peak, and faster on Pascal, whose fp16 math is slow."""
     F.scaled_dot_product_attention = _sdpa_fp32
+
+
+def offload_to_ram(module: torch.nn.Module, device: torch.device) -> None:
+    """Keep this module's weights in (pinned) RAM; copy them to the GPU only for its
+    forward pass and drop the GPU copy right after. No copy back: weights don't change."""
+    tensors = list(module.named_parameters()) + list(module.named_buffers())
+    ram = {}
+    for name, t in tensors:
+        data = t.data.float().cpu()
+        try:
+            data = data.pin_memory()  # faster copies; needs locked memory, skip if refused
+        except RuntimeError:
+            pass
+        ram[name] = data
+        t.data = data
+
+    def to_gpu(mod, args):
+        for name, t in tensors:
+            t.data = ram[name].to(device, non_blocking=True)
+
+    def to_ram(mod, args, out):
+        for name, t in tensors:
+            t.data = ram[name]
+
+    module.register_forward_pre_hook(to_gpu)
+    module.register_forward_hook(to_ram)
+    module._apply = lambda fn, *a, **k: module  # predictor.to(device) must not move it
 
 
 def free_gpu_memory() -> None:

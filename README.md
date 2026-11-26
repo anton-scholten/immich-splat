@@ -12,16 +12,19 @@ Immich: tag "splat" → workflow webhook → app (downloads photo) → worker (G
 
 - Docker with Compose v2, on the same machine/Docker network as Immich
 - Immich **v3.0.0+** (Workflows, still a preview feature)
-- NVIDIA GPU with **4 GB VRAM minimum (6 GB recommended)**, driver 525+, and the
+- NVIDIA GPU with **6 GB VRAM recommended (4 GB minimum)**, driver 525+, and the
   [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
 - About 15 GB disk for the images and model
 
-| GPU VRAM | Works? |
-|---|---|
-| 10 GB+ | Yes, full precision (fp32) |
-| 6–8 GB | Yes, half precision (fp16), chosen automatically, same visual result |
-| 4 GB | Only if nothing else uses the GPU (no desktop on it); needs ~3.7 GiB free |
-| less | Falls back to the CPU automatically (about 1 min per photo, ~8 GB RAM) |
+| GPU VRAM | Mode (chosen automatically) | Time per photo* |
+|---|---|---|
+| 10 GB+ | fp32 on the GPU | ~7 s |
+| 6–8 GB | fp32, the two big encoders kept in RAM and copied in when used | ~10 s |
+| 4 GB | fp16, only if nothing else uses the GPU (needs ~3.7 GiB free) | ~12 s |
+| less | CPU, ~8 GB RAM | 1 min (6-core) to 20 min (old CPU) |
+
+\*Measured on a TITAN Xp (Pascal); a GTX 1660 is roughly 2× slower. The first photo
+after a start takes longer while the model loads.
 
 ## Setup
 
@@ -79,14 +82,11 @@ Your `.env` and data volumes are kept. `docker image prune` frees old image laye
 
 ## GPU and CPU options
 
-- `SHARP_PRECISION=auto` (default) uses fp32 on 10 GB+ GPUs, else fp16. Force with
-  `fp32` or `fp16`.
-- fp16 runs attention in fp32, and on GTX 16xx cards (known to give NaN in fp16) the
-  worker also turns on the cuDNN benchmark workaround from stable-diffusion-webui.
-- If a photo still fails on the GPU (out of memory or NaN), the worker steps down by
-  itself and remembers it: fp32 → fp16 → fp16 with those workarounds → CPU (1–5 min per
-  photo depending on the CPU, ~8 GB RAM). Each job's `precision` field in `/api/jobs`
-  shows what it ran on.
+- `SHARP_PRECISION=auto` (default) picks the mode from the table. Force one with
+  `fp32`, `fp32-offload` or `fp16`.
+- If a photo fails (out of memory, or NaN results, which GTX 16xx cards give in fp16),
+  the worker steps down by itself and remembers it: fp32 → fp32-offload → fp16 → CPU.
+  Each job's `precision` field in `/api/jobs` shows what it ran on.
 - For Turing or newer GPUs, `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128`
   gives newer CUDA wheels; the default (cu126) also supports older Pascal cards.
 - **CPU only:** set `SHARP_DEVICE=cpu` and add a `docker-compose.override.yml`:
