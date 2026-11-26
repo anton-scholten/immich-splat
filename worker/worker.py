@@ -24,12 +24,13 @@ from pathlib import Path
 import psutil
 import pillow_heif
 import torch
+import torch.nn.functional as F
 from PIL import Image
 
-from sharp.cli.predict import DEFAULT_MODEL_URL, predict_image
+from sharp.cli.predict import DEFAULT_MODEL_URL
 from sharp.models import PredictorParams, create_predictor
 from sharp.utils import io
-from sharp.utils.gaussians import save_ply
+from sharp.utils.gaussians import Gaussians3D, save_ply, unproject_gaussians
 
 pillow_heif.register_heif_opener()  # so Pillow can open .heif/.heic too
 
@@ -101,18 +102,27 @@ class Model:
     """The ml-sharp predictor plus the precision it currently runs in."""
 
     def __init__(self, device: torch.device):
+        self.device = device
+        self._load()
+
+    def _load(self) -> None:
         log.info("Loading model (downloads ~1.2GB on first run into %s)", os.environ.get("TORCH_HOME"))
         state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=False)
         self.predictor = create_predictor(PredictorParams())
         self.predictor.load_state_dict(state_dict)
         del state_dict
         self.predictor.eval()
-        self.device = device
         self.precision = "fp32"
         if self._want_fp16():
             self._convert_to_fp16()  # convert on the CPU so the fp32 copy never hits the GPU
-        self.predictor.to(device)
-        log.info("Model on %s in %s", device, self.precision)
+        self.predictor.to(self.device)
+        log.info("Model on %s in %s", self.device, self.precision)
+
+    @property
+    def label(self) -> str:
+        """What the job ran on, e.g. "cuda-fp16" or "cpu-fp32"."""
+        extra = "-nocudnn" if self.device.type == "cuda" and not torch.backends.cudnn.enabled else ""
+        return f"{self.device.type}-{self.precision}{extra}"
 
     def _want_fp16(self) -> bool:
         if self.device.type != "cuda" or SHARP_PRECISION == "fp32":
@@ -132,19 +142,84 @@ class Model:
         )
         self.precision = "fp16"
 
-    def switch_to_fp16(self) -> bool:
-        """After an out-of-memory error: True if switched (worth retrying), False if already fp16/CPU."""
-        if self.device.type != "cuda" or self.precision == "fp16":
+    def next_fallback(self, problem: str) -> bool:
+        """Step down after a failed prediction; True if there is something left to try.
+
+        problem "oom": fp32 -> fp16 -> CPU.  problem "nan": fp16 -> fp16 without cuDNN
+        (GTX 16xx cards are known to produce NaN in fp16) -> CPU. The new setting is kept
+        for later jobs, so a GPU that can't do it only costs one failed try.
+        """
+        if self.device.type != "cuda":
             return False
-        self._convert_to_fp16()
+        if problem == "oom" and self.precision == "fp32":
+            self._convert_to_fp16()
+            log.warning("Out of GPU memory in fp32; switched the model to fp16 for this and later jobs")
+            return True
+        if problem == "nan" and self.precision == "fp16" and torch.backends.cudnn.enabled:
+            torch.backends.cudnn.enabled = False
+            log.warning("fp16 gave NaN/inf on this GPU; retrying with cuDNN disabled")
+            return True
+        reason = "not enough GPU memory" if problem == "oom" else "this GPU gives NaN/inf results"
+        log.warning("%s; moving the model to the CPU (much slower, about 1 min per photo)", reason)
+        self.predictor = None
         free_gpu_memory()
-        log.warning("Out of GPU memory in fp32; switched the model to fp16 for this and later jobs")
+        self.device = torch.device("cpu")
+        self._load()
+        with state_lock:
+            status["device"] = "cpu"
         return True
 
-    def predict(self, image, f_px: float):
-        gaussians = predict_image(self.predictor, image, f_px, self.device)
-        # fp16 outputs -> fp32 so depth, PLY export and conversion behave as before
-        return type(gaussians)(*[t.float() if torch.is_tensor(t) else t for t in gaussians])
+    @torch.no_grad()
+    def predict(self, image, f_px: float) -> Gaussians3D:
+        """Same steps as sharp.cli.predict.predict_image, except the model output is
+        converted to fp32 BEFORE unprojection. ml-sharp's unprojection squares the
+        Gaussian scales in the input dtype, which overflows fp16 for far-away content
+        (inf -> "linalg.svd ... non-finite values")."""
+        size = 1536  # ml-sharp's fixed internal resolution
+        dev = self.device
+        x = torch.from_numpy(image.copy()).float().to(dev).permute(2, 0, 1) / 255.0
+        _, height, width = x.shape
+        disparity_factor = torch.tensor([f_px / width]).float().to(dev)
+        x = F.interpolate(x[None], size=(size, size), mode="bilinear", align_corners=True)
+
+        ndc = self.predictor(x, disparity_factor)
+        del x
+        ndc = Gaussians3D(*[t.float() for t in ndc])
+        ndc = drop_nonfinite(ndc, "model output")
+
+        intrinsics = torch.tensor(
+            [[f_px, 0, width / 2, 0], [0, f_px, height / 2, 0], [0, 0, 1, 0], [0, 0, 0, 1]],
+            dtype=torch.float32, device=dev,
+        )
+        intrinsics[0] *= size / width
+        intrinsics[1] *= size / height
+        gaussians = unproject_gaussians(ndc, torch.eye(4, device=dev), intrinsics, (size, size))
+        return drop_nonfinite(Gaussians3D(*[t.float() for t in gaussians]), "unprojection")
+
+
+MAX_DROPPED_FRACTION = 0.01
+
+
+class NonFiniteOutput(RuntimeError):
+    """Too many NaN/inf Gaussians: the result is unusable on this device/precision."""
+
+
+def drop_nonfinite(g: Gaussians3D, where: str) -> Gaussians3D:
+    """Remove Gaussians with any NaN/inf value instead of failing the whole job.
+    A handful is harmless; more than 1% means the result is broken, so raise."""
+    ok = None
+    for t in g:
+        finite = torch.isfinite(t.reshape(t.shape[0], t.shape[1], -1)).all(dim=-1)  # [batch, N]
+        ok = finite if ok is None else ok & finite
+    bad = int((~ok).sum())
+    if bad == 0:
+        return g
+    total = ok.numel()
+    if bad > MAX_DROPPED_FRACTION * total:
+        raise NonFiniteOutput(f"{bad} of {total} Gaussians are NaN/inf after {where}; result unusable")
+    log.warning("Dropping %d of %d non-finite Gaussians after %s", bad, total, where)
+    keep = ok[0]  # batch size is 1
+    return Gaussians3D(*[t[:, keep] for t in g])
 
 
 def free_gpu_memory() -> None:
@@ -152,14 +227,6 @@ def free_gpu_memory() -> None:
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-
-
-def gpu_memory_text(device: torch.device) -> str:
-    try:
-        free, total = torch.cuda.mem_get_info(device)
-        return f"{free / GIB:.1f} of {total / GIB:.1f} GiB free"
-    except Exception:
-        return "free memory unknown"
 
 
 def exif_has_focal(path: Path) -> bool:
@@ -330,22 +397,19 @@ def run_splat_transform(ply: Path, spz: Path) -> None:
 
 
 def predict_with_fallback(model: Model, image, f_px: float):
-    """Predict; on out-of-memory switch fp32 -> fp16 once and retry."""
-    try:
-        return model.predict(image, f_px)
-    except torch.OutOfMemoryError:
-        pass  # leave the except block first so the traceback (and its tensors) is freed
-    free_gpu_memory()
-    if model.switch_to_fp16():
+    """Predict, stepping down GPU precision / to the CPU on out-of-memory or NaN results."""
+    while True:
         try:
             return model.predict(image, f_px)
         except torch.OutOfMemoryError:
-            pass
+            problem = "oom"  # handled below, outside the except block, so its tensors are freed
+        except NonFiniteOutput:
+            problem = "nan"
         free_gpu_memory()
-    raise RuntimeError(
-        f"Not enough GPU memory ({gpu_memory_text(model.device)}; needs about 3.7 GiB free "
-        "in fp16). Close other programs using the GPU, or set SHARP_DEVICE=cpu."
-    )
+        if not model.next_fallback(problem):
+            if problem == "oom":
+                raise RuntimeError("Not enough memory to run the model, even on the CPU (needs about 8 GB RAM).")
+            raise RuntimeError("The model produced NaN/inf values even on the CPU; this photo can't be converted.")
 
 
 def process(job: dict, model: Model, timings: dict) -> None:
@@ -367,7 +431,7 @@ def process(job: dict, model: Model, timings: dict) -> None:
 
     set_stage(job, "predicting", timings, marks)
     gaussians = predict_with_fallback(model, image, f_px)
-    job["precision"] = model.precision
+    job["precision"] = model.label
     depth = float(gaussians.mean_vectors[..., 2].flatten().median().item())  # OpenCV z, forward
     count = int(gaussians.mean_vectors.shape[0] * gaussians.mean_vectors.shape[1])
 
