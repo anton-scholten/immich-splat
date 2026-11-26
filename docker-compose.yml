@@ -40,6 +40,7 @@ services:
       POLL_INTERVAL: ${POLL_INTERVAL:-3}
       KEEP_PLY: ${KEEP_PLY:-false}
       SHARP_DEVICE: ${SHARP_DEVICE:-default}
+      SHARP_PRECISION: ${SHARP_PRECISION:-auto}
     # Default network only (outbound internet for the first model download).
     networks:
       - default

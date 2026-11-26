@@ -7,6 +7,7 @@ each job runs it in-process, converts the PLY to .spz with splat-transform
 settings.json. A background thread writes /data/status/worker.json every 2 s.
 """
 
+import gc
 import json
 import logging
 import math
@@ -45,6 +46,7 @@ CACHE_DIR = Path("/cache")
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
 KEEP_PLY = os.environ.get("KEEP_PLY", "false").lower() in ("1", "true", "yes")
 SHARP_DEVICE = os.environ.get("SHARP_DEVICE", "default")
+SHARP_PRECISION = os.environ.get("SHARP_PRECISION", "auto").lower()  # auto | fp32 | fp16
 SPLAT_TRANSFORM_TIMEOUT = 600
 HEARTBEAT_INTERVAL = 2
 STAGES = ("loading", "predicting", "saving", "converting")
@@ -89,14 +91,75 @@ def jobs_with_status(status: str) -> list[dict]:
     return jobs
 
 
-def load_model(device: torch.device):
-    log.info("Loading model (downloads ~1.2GB on first run into %s)", os.environ.get("TORCH_HOME"))
-    state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=False)
-    predictor = create_predictor(PredictorParams())
-    predictor.load_state_dict(state_dict)
-    predictor.eval()
-    predictor.to(device)
-    return predictor
+GIB = 1024**3
+# Measured on ml-sharp at its fixed 1536x1536 input: fp32 weights 2.6 GiB, peak 7.5 GiB;
+# fp16 weights 1.4 GiB, peak 4.3 GiB. Below this much VRAM, start in fp16.
+FP32_MIN_VRAM = 10 * GIB
+
+
+class Model:
+    """The ml-sharp predictor plus the precision it currently runs in."""
+
+    def __init__(self, device: torch.device):
+        log.info("Loading model (downloads ~1.2GB on first run into %s)", os.environ.get("TORCH_HOME"))
+        state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=False)
+        self.predictor = create_predictor(PredictorParams())
+        self.predictor.load_state_dict(state_dict)
+        del state_dict
+        self.predictor.eval()
+        self.device = device
+        self.precision = "fp32"
+        if self._want_fp16():
+            self._convert_to_fp16()  # convert on the CPU so the fp32 copy never hits the GPU
+        self.predictor.to(device)
+        log.info("Model on %s in %s", device, self.precision)
+
+    def _want_fp16(self) -> bool:
+        if self.device.type != "cuda" or SHARP_PRECISION == "fp32":
+            return False
+        if SHARP_PRECISION == "fp16":
+            return True
+        total = torch.cuda.get_device_properties(self.device).total_memory
+        if total < FP32_MIN_VRAM:
+            log.info("GPU has %.1f GiB; using fp16 to fit (set SHARP_PRECISION=fp32 to force)", total / GIB)
+            return True
+        return False
+
+    def _convert_to_fp16(self) -> None:
+        self.predictor.half()
+        self.predictor.register_forward_pre_hook(
+            lambda mod, args: tuple(a.half() if torch.is_tensor(a) and a.is_floating_point() else a for a in args)
+        )
+        self.precision = "fp16"
+
+    def switch_to_fp16(self) -> bool:
+        """After an out-of-memory error: True if switched (worth retrying), False if already fp16/CPU."""
+        if self.device.type != "cuda" or self.precision == "fp16":
+            return False
+        self._convert_to_fp16()
+        free_gpu_memory()
+        log.warning("Out of GPU memory in fp32; switched the model to fp16 for this and later jobs")
+        return True
+
+    def predict(self, image, f_px: float):
+        gaussians = predict_image(self.predictor, image, f_px, self.device)
+        # fp16 outputs -> fp32 so depth, PLY export and conversion behave as before
+        return type(gaussians)(*[t.float() if torch.is_tensor(t) else t for t in gaussians])
+
+
+def free_gpu_memory() -> None:
+    """Give cached GPU memory back so idle VRAM is just the model weights."""
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def gpu_memory_text(device: torch.device) -> str:
+    try:
+        free, total = torch.cuda.mem_get_info(device)
+        return f"{free / GIB:.1f} of {total / GIB:.1f} GiB free"
+    except Exception:
+        return "free memory unknown"
 
 
 def exif_has_focal(path: Path) -> bool:
@@ -266,7 +329,26 @@ def run_splat_transform(ply: Path, spz: Path) -> None:
         raise RuntimeError("splat-transform failed: " + (result.stderr or result.stdout)[-500:])
 
 
-def process(job: dict, predictor, device: torch.device, timings: dict) -> None:
+def predict_with_fallback(model: Model, image, f_px: float):
+    """Predict; on out-of-memory switch fp32 -> fp16 once and retry."""
+    try:
+        return model.predict(image, f_px)
+    except torch.OutOfMemoryError:
+        pass  # leave the except block first so the traceback (and its tensors) is freed
+    free_gpu_memory()
+    if model.switch_to_fp16():
+        try:
+            return model.predict(image, f_px)
+        except torch.OutOfMemoryError:
+            pass
+        free_gpu_memory()
+    raise RuntimeError(
+        f"Not enough GPU memory ({gpu_memory_text(model.device)}; needs about 4.5 GiB free "
+        "in fp16). Close other programs using the GPU, or set SHARP_DEVICE=cpu."
+    )
+
+
+def process(job: dict, model: Model, timings: dict) -> None:
     job_id = job["id"]
     image_path = Path(job["incoming_path"])
     out_dir = SPLATS_DIR / job_id
@@ -284,7 +366,8 @@ def process(job: dict, predictor, device: torch.device, timings: dict) -> None:
     log.info("Job %s: %dx%d f_px=%.1f", job_id, width, height, f_px)
 
     set_stage(job, "predicting", timings, marks)
-    gaussians = predict_image(predictor, image, f_px, device)
+    gaussians = predict_with_fallback(model, image, f_px)
+    job["precision"] = model.precision
     depth = float(gaussians.mean_vectors[..., 2].flatten().median().item())  # OpenCV z, forward
     count = int(gaussians.mean_vectors.shape[0] * gaussians.mean_vectors.shape[1])
 
@@ -314,7 +397,7 @@ def process(job: dict, predictor, device: torch.device, timings: dict) -> None:
         job["ply_url"] = f"/splats/{job_id}/scene.ply"
 
 
-def run_job(job: dict, predictor, device: torch.device) -> None:
+def run_job(job: dict, model: Model) -> None:
     started = time.monotonic()
     job["status"] = "processing"
     job["started_at"] = now()
@@ -326,12 +409,13 @@ def run_job(job: dict, predictor, device: torch.device) -> None:
     log.info("Job %s: processing asset %s", job["id"], job.get("asset_id"))
     timings: dict = {}
     try:
-        process(job, predictor, device, timings)
+        process(job, model, timings)
     except Exception as e:  # keep the loop alive no matter what
         log.exception("Job %s failed", job["id"])
         shutil.rmtree(SPLATS_DIR / job["id"], ignore_errors=True)
         job["status"] = "error"
         job["error"] = f"{type(e).__name__}: {e}"[:300]
+    free_gpu_memory()  # after the except block, so the failed job's tensors are released too
     job["finished_at"] = now()
     job["duration_s"] = round(time.monotonic() - started, 2)
     job.pop("stage", None)
@@ -362,7 +446,8 @@ def main() -> None:
     seed_recent()
     status["device"] = device.type
     threading.Thread(target=heartbeat_loop, args=(device,), daemon=True).start()
-    predictor = load_model(device)
+    model = Model(device)
+    free_gpu_memory()
     with state_lock:
         status["state"] = "idle"
 
@@ -371,7 +456,7 @@ def main() -> None:
         try:
             queued = jobs_with_status("queued")
             for job in queued:
-                run_job(job, predictor, device)
+                run_job(job, model)
             if not queued:
                 time.sleep(POLL_INTERVAL)
         except Exception:

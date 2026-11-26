@@ -184,6 +184,15 @@ The model checkpoint is in `/cache` (the `model_cache` volume).
   which still support older Pascal GPUs (GTX 10xx, TITAN Xp). For Turing or newer
   you can build with
   `--build-arg TORCH_INDEX_URL=https://download.pytorch.org/whl/cu128`.
+- **GPU memory.** The model works at a fixed 1536×1536 size, so VRAM use does not
+  depend on the photo. In fp32 it needs about 7.5 GiB, in fp16 about 4.5 GiB, which
+  fits 6 GB cards. `SHARP_PRECISION=auto` (the default) picks fp32 on GPUs with 10 GiB
+  or more and fp16 below that; if fp32 still runs out of memory, the worker switches to
+  fp16 and retries. Set `SHARP_PRECISION=fp32` or `fp16` to force one. fp16 looks the
+  same in the viewer; on older Pascal cards (GTX 10xx) it is slower, on newer cards it
+  is usually faster. Other programs using the GPU (games, other AI containers) reduce
+  what is free. After each job the worker gives back its cached memory, so at idle it
+  only holds the model (about 1.4 GiB in fp16, 2.6 GiB in fp32).
 - **CPU fallback:** set `SHARP_DEVICE=cpu` in `.env`, and drop the GPU request with a
   `docker-compose.override.yml` next to `docker-compose.yml` (Compose loads it
   automatically, and git ignores it). It works, but each photo takes much longer.
