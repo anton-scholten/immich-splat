@@ -81,7 +81,17 @@ ml-sharp's model checkpoint (~1.2 GB) into the `model_cache` volume; this happen
 
 ## 4. Wire up Immich
 
-In Immich, first create a tag (e.g. `splat`). Then go to **Workflows** and create a workflow:
+**Turn on tags first.** Immich hides tags until you enable them, per user account:
+in Immich web open **Account Settings → Features → Tags**, switch **Enable** on
+(also switch **Sidebar** on to get a *Tags* page in the left menu), and save.
+The setting is stored on the server, so the phone apps pick it up too.
+
+**Create the tag.** Open **Tags** in the sidebar and choose **Create tag**, name it
+`splat`. (Or select any photo, press `t` or choose **Tag**, type `splat` and create it
+there.) The workflow's tag filter below can only pick a tag that already exists, so
+create it before the workflow. Tags added before the workflow exists send nothing.
+
+Then go to **Workflows** and create a workflow:
 
 - **Trigger:** *Asset tagged*
 - **Filter:** *Filter by tags* = `splat`
@@ -93,10 +103,10 @@ In Immich, first create a tag (e.g. `splat`). Then go to **Workflows** and creat
 
 Save and enable the workflow.
 
-The tag filter matters: Immich workflows have only four triggers (*Asset created*,
+Why a tag and not an album: Immich workflows have only four triggers (*Asset created*,
 *Asset metadata extracted*, *Asset OCR extracted*, *Asset tagged*). There is no
-"added to album" trigger. Without the tag filter, every tag added to any photo
-would send a job.
+"added to album" trigger, so adding a photo to an album cannot send it. The tag
+filter matters too: without it, every tag added to any photo would send a job.
 
 The URL uses the container name, so Immich's server must be on the same Docker
 network as `immich-splat-app` (the app joins `IMMICH_NETWORK` for this).
@@ -105,12 +115,13 @@ network as `immich-splat-app` (the app joins `IMMICH_NETWORK` for this).
 
 Tagging a photo `splat` in Immich is the only way to send one. Pick your device:
 
+Tags must be turned on for your account first (step 4). Then:
+
 **Immich web** (PC, phone or VR headset browser):
-open the photo, select it, choose **Tag**, then pick `splat`.
+select the photo(s), choose **Tag** (in the ⋮ menu if it is not shown), then pick `splat`.
 
 **Immich Android and iOS apps:**
-tags must be enabled first: **Account settings → Features → Tags**.
-Then open the photo, select it, choose **Add tags**, then pick `splat`.
+select the photo(s), choose **Add tags**, then pick `splat`.
 (menu names may differ slightly by Immich version)
 
 The job then goes `queued` → `processing` → `done` and appears in the gallery.
