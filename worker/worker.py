@@ -4,7 +4,7 @@ immich-splat worker
 Polls /data/jobs for queued jobs. The ml-sharp model is loaded once at startup;
 each job runs it in-process, converts the PLY to .spz with splat-transform
 (rotated 180 deg about X so the scene is y-up), and writes the per-job viewer
-settings.json and thumb.jpg.
+settings.json. A background thread writes /data/status/worker.json every 2 s.
 """
 
 import json
@@ -14,11 +14,13 @@ import os
 import shutil
 import subprocess
 import tempfile
+import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
-import numpy as np
+import psutil
 import pillow_heif
 import torch
 from PIL import Image
@@ -37,12 +39,20 @@ DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
 JOBS_DIR = DATA_DIR / "jobs"
 INCOMING_DIR = DATA_DIR / "incoming"
 SPLATS_DIR = DATA_DIR / "splats"
+STATUS_DIR = DATA_DIR / "status"
+CACHE_DIR = Path("/cache")
 
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", "3"))
 KEEP_PLY = os.environ.get("KEEP_PLY", "false").lower() in ("1", "true", "yes")
 SHARP_DEVICE = os.environ.get("SHARP_DEVICE", "default")
 SPLAT_TRANSFORM_TIMEOUT = 600
-THUMB_SIZE = 512
+HEARTBEAT_INTERVAL = 2
+STAGES = ("loading", "predicting", "saving", "converting")
+
+# Shared between the main thread (jobs) and the heartbeat thread (status file).
+state_lock = threading.Lock()
+status = {"state": "loading_model", "current_job": None, "device": "cpu"}
+recent = deque(maxlen=10)  # last 10 successful jobs: {"total": s, "stages": {name: s}}
 
 
 def now() -> str:
@@ -52,10 +62,14 @@ def now() -> str:
 def write_job(job: dict) -> None:
     """Atomic write: temp file in the same dir, then replace."""
     job["updated_at"] = now()
-    fd, tmp = tempfile.mkstemp(dir=str(JOBS_DIR), suffix=".tmp")
+    write_json_atomic(JOBS_DIR / f"{job['id']}.json", job)
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")  # unique name per call
     with os.fdopen(fd, "w") as f:
-        json.dump(job, f, indent=2)
-    os.replace(tmp, JOBS_DIR / f"{job['id']}.json")
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def read_job(path: Path) -> dict | None:
@@ -83,6 +97,16 @@ def load_model(device: torch.device):
     predictor.eval()
     predictor.to(device)
     return predictor
+
+
+def exif_has_focal(path: Path) -> bool:
+    """True if the file's EXIF has a focal length that load_rgb would use."""
+    try:
+        with Image.open(path) as im:
+            exif = io.extract_exif(im)
+    except Exception:
+        return False
+    return any(exif.get(k) for k in ("FocalLengthIn35mmFilm", "FocalLenIn35mmFilm", "FocalLength"))
 
 
 def focal_px_from_mm(width: int, height: int, focal_mm: float) -> float:
@@ -121,10 +145,117 @@ def make_settings(f_px: float, width: int, height: int, depth: float) -> dict:
     }
 
 
-def write_thumb(image: np.ndarray, path: Path) -> None:
-    img = Image.fromarray(image).convert("RGB")  # already EXIF-rotated by load_rgb
-    img.thumbnail((THUMB_SIZE, THUMB_SIZE), Image.LANCZOS)
-    img.save(path, "JPEG", quality=85)
+def seed_recent() -> None:
+    """After a restart, seed the duration average from existing done jobs (no per-stage data)."""
+    done = [j for j in jobs_with_status("done") if j.get("duration_s")]
+    done.sort(key=lambda j: j.get("finished_at") or "")
+    for j in done[-recent.maxlen:]:
+        recent.append({"total": float(j["duration_s"]), "stages": {}})
+
+
+def averages() -> tuple[float | None, dict]:
+    with state_lock:
+        items = list(recent)
+    avg = round(sum(r["total"] for r in items) / len(items), 2) if items else None
+    stage_avg = {}
+    for name in STAGES:
+        vals = [r["stages"][name] for r in items if name in r["stages"]]
+        stage_avg[name] = round(sum(vals) / len(vals), 2) if vals else None
+    return avg, stage_avg
+
+
+class GpuStats:
+    """NVML when available, else torch.cuda.mem_get_info (util null). Never raises."""
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.nvml = None
+        if device.type != "cuda":
+            return
+        try:
+            import pynvml
+
+            pynvml.nvmlInit()
+            index = device.index or 0
+            self.handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            self.nvml = pynvml
+        except Exception as e:
+            log.warning("NVML unavailable (%s), falling back to torch.cuda.mem_get_info", e)
+
+    def read(self) -> dict | None:
+        if self.device.type != "cuda":
+            return None
+        try:
+            if self.nvml:
+                name = self.nvml.nvmlDeviceGetName(self.handle)
+                if isinstance(name, bytes):
+                    name = name.decode()
+                util = self.nvml.nvmlDeviceGetUtilizationRates(self.handle)
+                mem = self.nvml.nvmlDeviceGetMemoryInfo(self.handle)
+                return {"name": name, "util_percent": int(util.gpu),
+                        "mem_used_bytes": int(mem.used), "mem_total_bytes": int(mem.total)}
+            free, total = torch.cuda.mem_get_info(self.device)
+            return {"name": torch.cuda.get_device_name(self.device), "util_percent": None,
+                    "mem_used_bytes": int(total - free), "mem_total_bytes": int(total)}
+        except Exception:
+            log.exception("GPU stats failed")
+            return None
+
+
+def dir_size(path: Path) -> int:
+    total = 0
+    for root, _, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def heartbeat_loop(device: torch.device) -> None:
+    """Write /data/status/worker.json every 2 s. Must never die."""
+    gpu = GpuStats(device)
+    proc = psutil.Process()
+    proc.cpu_percent(None)  # prime; later calls measure since the previous call
+    queue_length, queue_at = 0, 0.0
+    cache_bytes, cache_at = None, 0.0
+    while True:
+        try:
+            t = time.monotonic()
+            if t - queue_at >= 5:
+                queue_length, queue_at = len(jobs_with_status("queued")), t
+            if cache_bytes is None or t - cache_at >= 60:
+                cache_bytes, cache_at = dir_size(CACHE_DIR), t
+            avg, stage_avg = averages()
+            with state_lock:
+                snap = dict(status)
+            write_json_atomic(STATUS_DIR / "worker.json", {
+                "updated_at": now(),
+                "state": snap["state"],
+                "current_job": snap["current_job"],
+                "queue_length": queue_length,
+                "device": device.type,
+                "gpu": gpu.read(),
+                "process": {"cpu_percent": proc.cpu_percent(None), "rss_bytes": proc.memory_info().rss},
+                "avg_duration_s": avg,
+                "stage_avg_s": stage_avg,
+                "model_cache_bytes": cache_bytes,
+            })
+        except Exception:
+            log.exception("Heartbeat error")
+        time.sleep(HEARTBEAT_INTERVAL)
+
+
+def set_stage(job: dict, name: str, timings: dict, marks: dict) -> None:
+    """Close the previous stage's timing, start `name`, and write the job."""
+    t = time.monotonic()
+    if marks.get("name"):
+        timings[marks["name"]] = t - marks["t"]
+    marks["name"], marks["t"] = name, t
+    job["stage"] = name
+    job["stage_started_at"] = now()
+    write_job(job)
 
 
 def run_splat_transform(ply: Path, spz: Path) -> None:
@@ -135,30 +266,39 @@ def run_splat_transform(ply: Path, spz: Path) -> None:
         raise RuntimeError("splat-transform failed: " + (result.stderr or result.stdout)[-500:])
 
 
-def process(job: dict, predictor, device: torch.device) -> None:
+def process(job: dict, predictor, device: torch.device, timings: dict) -> None:
     job_id = job["id"]
     image_path = Path(job["incoming_path"])
     out_dir = SPLATS_DIR / job_id
     out_dir.mkdir(parents=True, exist_ok=True)
+    marks: dict = {}
 
+    set_stage(job, "loading", timings, marks)
     image, _, f_px = io.load_rgb(image_path)
     height, width = image.shape[:2]
-    if job.get("image_kind") == "preview" and job.get("focal_length_mm"):
+    # load_rgb falls back to 30mm when the file has no focal length (Immich previews
+    # never do). Immich's own EXIF value is better than that guess.
+    if job.get("focal_length_mm") and (job.get("image_kind") == "preview" or not exif_has_focal(image_path)):
         f_px = focal_px_from_mm(width, height, float(job["focal_length_mm"]))
+    job["width"], job["height"] = width, height
     log.info("Job %s: %dx%d f_px=%.1f", job_id, width, height, f_px)
 
+    set_stage(job, "predicting", timings, marks)
     gaussians = predict_image(predictor, image, f_px, device)
     depth = float(gaussians.mean_vectors[..., 2].flatten().median().item())  # OpenCV z, forward
     count = int(gaussians.mean_vectors.shape[0] * gaussians.mean_vectors.shape[1])
 
+    set_stage(job, "saving", timings, marks)
     ply = out_dir / "scene.ply"
     save_ply(gaussians, f_px, (height, width), ply)
-    run_splat_transform(ply, out_dir / "scene.spz")
+
+    set_stage(job, "converting", timings, marks)
+    spz = out_dir / "scene.spz"
+    run_splat_transform(ply, spz)
     if not KEEP_PLY:
         ply.unlink(missing_ok=True)
-
     (out_dir / "settings.json").write_text(json.dumps(make_settings(f_px, width, height, depth), indent=2))
-    write_thumb(image, out_dir / "thumb.jpg")
+    timings[marks["name"]] = time.monotonic() - marks["t"]
 
     shutil.rmtree(INCOMING_DIR / job_id, ignore_errors=True)
 
@@ -166,7 +306,7 @@ def process(job: dict, predictor, device: torch.device) -> None:
         status="done",
         error=None,
         gaussians=count,
-        thumb_url=f"/splats/{job_id}/thumb.jpg",
+        splat_bytes=spz.stat().st_size,
         splat_url=f"/splats/{job_id}/scene.spz",
         settings_url=f"/splats/{job_id}/settings.json",
     )
@@ -179,10 +319,14 @@ def run_job(job: dict, predictor, device: torch.device) -> None:
     job["status"] = "processing"
     job["started_at"] = now()
     job["error"] = None
+    job["stage"] = None
     write_job(job)
+    with state_lock:
+        status.update(state="busy", current_job=job["id"])
     log.info("Job %s: processing asset %s", job["id"], job.get("asset_id"))
+    timings: dict = {}
     try:
-        process(job, predictor, device)
+        process(job, predictor, device, timings)
     except Exception as e:  # keep the loop alive no matter what
         log.exception("Job %s failed", job["id"])
         shutil.rmtree(SPLATS_DIR / job["id"], ignore_errors=True)
@@ -190,12 +334,18 @@ def run_job(job: dict, predictor, device: torch.device) -> None:
         job["error"] = f"{type(e).__name__}: {e}"[:300]
     job["finished_at"] = now()
     job["duration_s"] = round(time.monotonic() - started, 2)
+    job.pop("stage", None)
+    job.pop("stage_started_at", None)
     write_job(job)
+    with state_lock:
+        if job["status"] == "done":
+            recent.append({"total": job["duration_s"], "stages": timings})
+        status.update(state="idle", current_job=None)
     log.info("Job %s: %s in %.1fs", job["id"], job["status"], job["duration_s"])
 
 
 def main() -> None:
-    for d in (JOBS_DIR, INCOMING_DIR, SPLATS_DIR):
+    for d in (JOBS_DIR, INCOMING_DIR, SPLATS_DIR, STATUS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
     # Crash recovery: anything left in "processing" goes back in the queue.
@@ -209,7 +359,12 @@ def main() -> None:
     else:
         device = torch.device(SHARP_DEVICE)
     log.info("Using device %s", device)
+    seed_recent()
+    status["device"] = device.type
+    threading.Thread(target=heartbeat_loop, args=(device,), daemon=True).start()
     predictor = load_model(device)
+    with state_lock:
+        status["state"] = "idle"
 
     log.info("Worker ready, polling %s every %ss", JOBS_DIR, POLL_INTERVAL)
     while True:

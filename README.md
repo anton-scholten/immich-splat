@@ -12,13 +12,13 @@ Immich: tag "splat" added to asset
    │  POST (X-Webhook-Secret header)
    ▼
 app (FastAPI) ──downloads original from Immich API──▶ /data/incoming/<job>/
-   │  writes /data/jobs/<job>.json (status: queued)
+   │  writes /data/jobs/<job>.json (status: queued) and /data/thumbs/<job>.jpg
    ▼
 worker (GPU) ──polls /data/jobs── runs ml-sharp (model kept loaded in memory)
-   │  writes /data/splats/<job>/scene.spz + settings.json + thumb.jpg
+   │  writes /data/splats/<job>/scene.spz + settings.json
    │  job status: done
    ▼
-app status page ──▶ /jobs/<job>  or  SuperSplat viewer (scene.spz, per-job camera)
+app gallery (/) ──▶ SuperSplat viewer (scene.spz, per-job camera)
 ```
 
 ## Requirements
@@ -51,6 +51,8 @@ Edit `.env`:
 - `WEBHOOK_SECRET` — generate with `openssl rand -hex 32`; you reuse it in step 4
 - `IMMICH_NETWORK` — the Docker network Immich runs on (usually `immich_default`)
 - `APP_BIND` — leave `127.0.0.1` and publish through a reverse proxy, or set another address
+- `IMMICH_PUBLIC_URL` — optional. The Immich address you open in your browser
+  (e.g. `https://photos.example.com`). Adds "Open in Immich" links to the gallery.
 
 Compose refuses to start if `IMMICH_URL`, `IMMICH_API_KEY` or `WEBHOOK_SECRET` is empty.
 
@@ -84,13 +86,35 @@ would send a job.
 The URL uses the container name, so Immich's server must be on the same Docker
 network as `immich-splat-app` (the app joins `IMMICH_NETWORK` for this).
 
-## 5. Use it
+## 5. Sending photos
 
-Tag a photo `splat`. In the app, open the status page at `http://<host>:8080`
-(or `/jobs/<id>` for one job: it waits, then opens the viewer by itself). Jobs go `queued` → `processing` → `done`. When a job
-is `done` the viewer link opens SuperSplat with `scene.spz` and the per-job camera,
-which starts paused on the same viewpoint as the original photo. Press play for a
-camera fly-around; drag to look around.
+Tagging a photo `splat` in Immich is the only way to send one. Pick your device:
+
+**Immich web** (PC, phone or VR headset browser):
+open the photo, select it, choose **Tag**, then pick `splat`.
+
+**Immich Android and iOS apps:**
+tags must be enabled first: **Account settings → Features → Tags**.
+Then open the photo, select it, choose **Add tags**, then pick `splat`.
+(menu names may differ slightly by Immich version)
+
+The job then goes `queued` → `processing` → `done` and appears in the gallery.
+
+## 6. Gallery
+
+Open `http://<host>:8080` to see the gallery.
+
+- **Thumbnails** of every photo you sent. Photos still being processed are dimmed
+  with a progress ring. Tap a finished one to open it in the SuperSplat viewer.
+  The viewer opens on the photo's own view; press play for camera motion, and drag
+  to look around.
+- **Sort** by date taken, date added, name, original size, splat size or processing
+  time, ascending or descending. **Filter** by status (all, ready, in progress, failed).
+- **Failed** jobs can be retried or deleted.
+- **Stats bar** shows disk use, host CPU and RAM, GPU load and the worker state.
+
+Jobs can be deleted from the gallery. This removes the job record, its thumbnail,
+its incoming photo and its splat files. Jobs in `processing` cannot be deleted.
 
 Use HTTPS through a reverse proxy to view it from a phone or VR headset. WebXR and
 other phone/VR features need a secure context.
@@ -101,15 +125,13 @@ Everything the stack writes is under `/data` (the `splat_data` volume):
 
 - `/data/incoming/<job_id>/original.*` — downloaded photo (deleted by the worker after success)
 - `/data/jobs/<job_id>.json` — job record and status
+- `/data/thumbs/<job_id>.jpg` — thumbnail for the gallery
 - `/data/splats/<job_id>/scene.spz` — splat for the viewer
 - `/data/splats/<job_id>/scene.ply` — only if `KEEP_PLY=true`
 - `/data/splats/<job_id>/settings.json` — per-job viewer settings (camera)
-- `/data/splats/<job_id>/thumb.jpg` — thumbnail for the status page
+- `/data/status/worker.json` — worker heartbeat (state, GPU and CPU load) for the stats bar
 
 The model checkpoint is in `/cache` (the `model_cache` volume).
-
-Jobs can be deleted from the status page. This removes the job record, its incoming
-photo and its splat files. Jobs in `processing` cannot be deleted.
 
 ## GPU notes
 

@@ -35,6 +35,8 @@ WORKDIR /opt/ml-sharp
 RUN pip install torch==2.8.0 torchvision==0.23.0 --index-url ${TORCH_INDEX_URL} \
     && sed -i '/^nvidia-/d' requirements.txt \
     && pip install -r requirements.txt
+# Small extras in their own layer so changing them doesn't rebuild the ~6.5 GB torch layer.
+RUN pip install nvidia-ml-py==13.580.82 psutil==7.1.0
 
 # ---- final image ---------------------------------------------------------------------
 FROM python:3.13-slim
