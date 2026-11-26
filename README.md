@@ -23,8 +23,8 @@ Immich: tag "splat" → workflow webhook → app (downloads photo) → worker (G
 | 4 GB | fp16, only if nothing else uses the GPU (needs ~3.7 GiB free) | ~12 s |
 | less | CPU, ~8 GB RAM | 1 min (6-core) to 20 min (old CPU) |
 
-\*Measured on a TITAN Xp (Pascal); a GTX 1660 is roughly 2× slower. The first photo
-after a start takes longer while the model loads.
+\*Measured on a TITAN Xp (Pascal). A GTX 1660 (6 GB, fp32-offload) took 24 s.
+The first photo after a start takes longer while the model loads.
 
 ## Setup
 
