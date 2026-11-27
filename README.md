@@ -4,6 +4,11 @@ Tag a photo `splat` in Immich and get a 3D Gaussian splat of it in your browser,
 made by Apple's [ml-sharp](https://github.com/apple/ml-sharp) and shown in the
 [SuperSplat viewer](https://github.com/playcanvas/supersplat-viewer).
 
+<p align="center">
+<a href="docs/screenshots/step1.jpg"><img src="docs/screenshots/step1.jpg" width="22%" alt="1. Open a photo in Immich and add a tag"></a> &rarr; <a href="docs/screenshots/step2.jpg"><img src="docs/screenshots/step2.jpg" width="22%" alt="2. Tag it splat"></a> &rarr; <a href="docs/screenshots/step3.jpg"><img src="docs/screenshots/step3.jpg" width="22%" alt="3. Gallery shows progress"></a> &rarr; <a href="docs/screenshots/step4.jpg"><img src="docs/screenshots/step4.jpg" width="22%" alt="4. The 3D splat in the viewer"></a>
+</p>
+<p align="center"><sub>Tag a photo &rarr; pick <code>splat</code> &rarr; it processes in the gallery &rarr; explore it in 3D</sub></p>
+
 ```
 Immich: tag "splat" → workflow webhook → app (downloads photo) → worker (GPU) → gallery → viewer
 ```
