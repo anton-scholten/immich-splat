@@ -16,6 +16,8 @@
     --ok: #4fb783;
     --warn: #e2b34f;
     --err: #ec6b6b;
+    --primary: #accbfa;      /* Immich dark-mode primary (172 203 250) */
+    --sel-bg: #404040;       /* Immich neutral-700 behind a selected thumbnail */
     color-scheme: dark;
   }
   * { box-sizing: border-box; }
@@ -60,6 +62,25 @@
   .ctl:hover { background: var(--panel2); }
   #count { margin-left: auto; color: var(--muted); font-size: 0.8rem; }
 
+  /* day / sort groups (Immich timeline day title: text-xs md:text-sm, pt-7 pb-5) */
+  .group { margin: 0; }
+  .day {
+    display: flex; align-items: center; height: 24px; box-sizing: content-box;
+    padding: 20px 0 12px; font-size: .75rem; font-weight: 500; color: var(--text);
+  }
+  .group:first-child .day { padding-top: 4px; }
+  @media (min-width: 768px) { .day { padding: 28px 0 20px; font-size: .875rem; } }
+  .day .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .day .t::first-letter { text-transform: uppercase; }
+  .daysel {
+    width: 0; height: 24px; flex: none; overflow: hidden; border: 0; padding: 0; background: none;
+    cursor: pointer; transition: width .2s ease-out; color: var(--muted);
+  }
+  .daysel svg { width: 24px; height: 24px; display: block; fill: currentColor; }
+  .group:hover .daysel, .group.allsel .daysel, body.selecting .daysel { width: 32px; }
+  .group.allsel .daysel { color: var(--primary); }
+  @media (hover: hover) { body.selecting .group:not(:hover):not(.allsel) .daysel { width: 0; } }
+
   /* grid */
   .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
   @media (min-width: 560px)  { .grid { grid-template-columns: repeat(4, 1fr); gap: 10px; } }
@@ -74,6 +95,8 @@
     transition: transform .15s, border-color .15s;
   }
   .open:hover { border-color: #3a4150; transform: translateY(-1px); }
+  .frame { position: absolute; inset: 0; transition: transform .15s; }
+  .open img { -webkit-touch-callout: none; user-select: none; }
   .open img { width: 100%; height: 100%; object-fit: cover; display: block; transition: filter .4s; }
   .tile.pending .open { cursor: default; }
   .tile.pending .open:hover { transform: none; }
@@ -84,6 +107,47 @@
     background: repeating-linear-gradient(45deg, #2a2f39 0 12px, #252932 12px 24px);
   }
   .tile.nothumb img { display: none; }
+
+  /* selection, as Immich's Thumbnail.svelte: hover gradient, check circle top-left,
+     selected = image scaled to 85% with rounded corners on a neutral background */
+  .open::after {
+    content: ""; position: absolute; inset: 0; pointer-events: none; opacity: 0; transition: opacity .15s;
+    background: linear-gradient(to bottom, rgba(0,0,0,.25), transparent 25%);
+  }
+  .tile:hover .open::after { opacity: 1; }
+  .tile.selected .open { background: var(--sel-bg); border-color: transparent; transform: none; }
+  .tile.selected .frame { transform: scale(.85); border-radius: 12px; overflow: hidden; }
+  .sel {
+    position: absolute; top: 0; left: 0; z-index: 2; padding: 8px; border: 0; background: none;
+    cursor: pointer; display: none; line-height: 0;
+  }
+  .sel svg { width: 24px; height: 24px; display: block; fill: rgba(255,255,255,.8); }
+  .sel:hover svg { fill: #fff; }
+  .sel span { display: block; border-radius: 50%; }
+  .tile:hover .sel, .tile.selected .sel { display: block; }
+  @media (hover: none) { body.selecting .sel { display: block; } }
+  .tile.selected .sel span { background: #232932; }
+  .tile.selected .sel svg { fill: var(--primary); }
+
+  /* selection bar (Immich AssetSelectControlBar: close, "N selected", actions) */
+  .selbar {
+    position: fixed; top: 0; left: 0; right: 0; z-index: 15; padding: 8px; display: none;
+  }
+  body.selecting .selbar { display: block; }
+  .selbar .bar {
+    max-width: 1400px; margin: 0 auto; display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+    background: var(--panel2); border: 1px solid var(--border); border-radius: 999px; padding: 6px 10px 6px 6px;
+    box-shadow: 0 4px 18px rgba(0,0,0,.45);
+  }
+  .selbar .x {
+    width: 40px; height: 40px; border-radius: 50%; border: 0; background: none; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .selbar .x:hover { background: rgba(255,255,255,.08); }
+  .selbar .x svg { width: 24px; height: 24px; fill: var(--text); }
+  .selbar .n { font-weight: 500; margin-right: auto; padding: 0 4px; }
+  .selbar .ctl { min-height: 36px; border-radius: 999px; padding: 4px 14px; font-size: .85rem; }
+  .selbar .ctl[hidden] { display: none; }
 
   .ring { position: absolute; inset: 0; display: none; flex-direction: column; align-items: center; justify-content: center; gap: 6px; pointer-events: none; }
   .tile.pending .ring { display: flex; }
@@ -180,7 +244,7 @@
     <span id="count" aria-live="polite"></span>
   </div>
 
-  <div class="grid" id="grid"></div>
+  <div id="groups"></div>
   <div class="empty" id="empty"></div>
 </div>
 
@@ -192,6 +256,15 @@
   </div>
 </div>
 <div class="toast" id="toast" role="status"></div>
+<div class="selbar" id="selbar" role="toolbar" aria-label="Selection">
+  <div class="bar">
+    <button class="x" id="selClear" type="button" aria-label="Clear selection"></button>
+    <span class="n" id="selCount" aria-live="polite"></span>
+    <button class="ctl" id="selAll" type="button">Select all</button>
+    <button class="ctl" id="selRetry" type="button">Retry</button>
+    <button class="ctl danger" id="selDelete" type="button">Delete</button>
+  </div>
+</div>
 
 <script>
 "use strict";
@@ -209,6 +282,17 @@ var prefs = {sort: "taken", dir: "desc", filter: "all", open: "same"};
 try { Object.assign(prefs, JSON.parse(localStorage.getItem("splat.prefs") || "{}")); } catch (e) {}
 
 var $ = function (id) { return document.getElementById(id); };
+// Material Design Icons used by Immich (mdiCheckCircle, mdiCircleOutline, mdiClose)
+var ICON = {
+  check: "M12 2C6.5 2 2 6.5 2 12S6.5 22 12 22 22 17.5 22 12 17.5 2 12 2M10 17L5 12L6.41 10.58L10 14.17L17.59 6.58L19 8L10 17Z",
+  circle: "M12,20A8,8 0 0,1 4,12A8,8 0 0,1 12,4A8,8 0 0,1 20,12A8,8 0 0,1 12,20M12,2A10,10 0 0,0 2,12A10,10 0 0,0 12,22A10,10 0 0,0 22,12A10,10 0 0,0 12,2Z",
+  close: "M19,6.41L17.59,5L12,10.59L6.41,5L5,6.41L10.59,12L5,17.59L6.41,19L12,13.41L17.59,19L19,17.59L13.41,12L19,6.41Z"
+};
+function icon(name) {
+  var s = svgEl("svg", {viewBox: "0 0 24 24", "aria-hidden": "true"});
+  s.appendChild(svgEl("path", {d: ICON[name]}));
+  return s;
+}
 function el(tag, cls, text) {
   var e = document.createElement(tag);
   if (cls) e.className = cls;
@@ -324,6 +408,140 @@ function visibleJobs() {
   return list;
 }
 
+/* ---------- groups ---------- */
+// Same rules as Immich's formatGroupTitle (web/src/lib/utils/timeline-util.ts).
+function startOfDay(d) { return new Date(d.getFullYear(), d.getMonth(), d.getDate()); }
+function dayTitle(d) {
+  var today = startOfDay(new Date()), day = startOfDay(d);
+  var diff = Math.round((today - day) / 86400000);
+  var rel = new Intl.RelativeTimeFormat(undefined, {numeric: "auto"});
+  if (diff === 0) return rel.format(0, "day");                       // today
+  if (diff === 1) return rel.format(-1, "day");                      // yesterday
+  if (diff > 1 && diff <= 6) return d.toLocaleDateString(undefined, {weekday: "long"});
+  if (d.getFullYear() === today.getFullYear())
+    return d.toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric"});
+  return fullDate(d);
+}
+function fullDate(d) {   // luxon DATE_MED_WITH_WEEKDAY
+  return d.toLocaleDateString(undefined, {weekday: "short", year: "numeric", month: "short", day: "numeric"});
+}
+function bin(v, edges, labels) {
+  for (var i = 0; i < edges.length; i++) if (v < edges[i]) return {key: "b" + i, label: labels[i]};
+  return {key: "b" + edges.length, label: labels[edges.length]};
+}
+var MB = 1024 * 1024;
+// Group for a job under the current sort. The list is sorted by the same key,
+// so each group's members are contiguous whatever the direction.
+function groupOf(j) {
+  var s = prefs.sort;
+  if (s === "taken" || s === "added") {
+    var t = ts(s === "taken" ? j.taken_at : j.created_at);
+    if (t == null) return {key: "none", label: "Unknown date"};
+    var d = new Date(t);
+    return {key: d.getFullYear() + "-" + d.getMonth() + "-" + d.getDate(), label: dayTitle(d), title: fullDate(d)};
+  }
+  if (s === "name") {
+    var c = (j.original_filename || "").charAt(0).toUpperCase();
+    return /\p{L}/u.test(c) ? {key: "n" + c, label: c} : {key: "n#", label: "#"};
+  }
+  var v = sortKey(j);
+  if (s === "orig" || s === "splat") {
+    if (v == null) return {key: "none", label: s === "splat" ? "No splat yet" : "Unknown size"};
+    return bin(v, [MB, 5 * MB, 20 * MB, 50 * MB], ["Under 1 MB", "1–5 MB", "5–20 MB", "20–50 MB", "50 MB and over"]);
+  }
+  if (v == null) return {key: "none", label: "Not processed yet"};
+  return bin(v, [15, 30, 60, 300], ["Under 15 s", "15–30 s", "30 s – 1 min", "1–5 min", "5 min and over"]);
+}
+var sections = new Map();   // group key -> section state
+function makeSection(key) {
+  var g = {key: key, ids: []};
+  g.el = el("section", "group");
+  var head = el("div", "day");
+  g.sel = el("button", "daysel"); g.sel.type = "button";
+  g.sel.appendChild(icon("circle"));
+  g.title = el("span", "t");
+  head.appendChild(g.sel); head.appendChild(g.title);
+  g.grid = el("div", "grid");
+  g.el.appendChild(head); g.el.appendChild(g.grid);
+  g.sel.addEventListener("click", function () {
+    var all = g.ids.every(function (id) { return selected.has(id); });
+    g.ids.forEach(function (id) { if (all) selected.delete(id); else selected.add(id); });
+    syncSelection();
+  });
+  return g;
+}
+
+/* ---------- selection ---------- */
+var selected = new Set();   // job ids
+var anchor = null;          // last toggled id, for shift-click ranges
+var order = [];             // visible ids in display order
+function toggleSelect(id, shift) {
+  if (shift && anchor && anchor !== id && order.indexOf(anchor) >= 0) {
+    var a = order.indexOf(anchor), b = order.indexOf(id);
+    order.slice(Math.min(a, b), Math.max(a, b) + 1).forEach(function (x) { selected.add(x); });
+  } else if (selected.has(id)) selected.delete(id);
+  else selected.add(id);
+  anchor = id;
+  syncSelection();
+}
+function clearSelection() { selected.clear(); anchor = null; syncSelection(); }
+function selectedJobs() { return jobs.filter(function (j) { return selected.has(j.id); }); }
+function syncSelection() {
+  tiles.forEach(function (t) {
+    var on = selected.has(t.id);
+    if (t.el.classList.contains("selected") !== on) {
+      t.el.classList.toggle("selected", on);
+      t.selIcon.replaceChildren(icon(on ? "check" : "circle"));
+    }
+    t.sel.setAttribute("aria-checked", on ? "true" : "false");
+  });
+  sections.forEach(function (g) {
+    var all = g.ids.length > 0 && g.ids.every(function (id) { return selected.has(id); });
+    if (g.el.classList.contains("allsel") !== all || !g.sel.firstChild) {
+      g.el.classList.toggle("allsel", all);
+      g.sel.replaceChildren(icon(all ? "check" : "circle"));
+    }
+    g.sel.setAttribute("aria-label", (all ? "Deselect " : "Select ") + g.title.textContent);
+  });
+  var n = selected.size, sj = selectedJobs();
+  document.body.classList.toggle("selecting", n > 0);
+  $("selCount").textContent = n + " selected";
+  $("selAll").hidden = n >= order.length;
+  var failed = sj.filter(function (j) { return j.status === "error"; }).length;
+  $("selRetry").hidden = failed === 0;
+  $("selRetry").textContent = "Retry " + failed;
+  var deletable = sj.filter(function (j) { return j.status !== "processing"; }).length;
+  $("selDelete").hidden = deletable === 0;
+  $("selDelete").textContent = "Delete " + deletable;
+}
+$("selClear").appendChild(icon("close"));
+$("selClear").addEventListener("click", clearSelection);
+$("selAll").addEventListener("click", function () { order.forEach(function (id) { selected.add(id); }); syncSelection(); });
+$("selRetry").addEventListener("click", async function () {
+  var list = selectedJobs().filter(function (j) { return j.status === "error"; }), bad = 0;
+  for (var i = 0; i < list.length; i++) {
+    try { await api("POST", "/api/jobs/" + encodeURIComponent(list[i].id) + "/retry"); } catch (e) { bad++; }
+  }
+  toast(bad ? "Retried " + (list.length - bad) + ", " + bad + " failed" : "Retrying " + list.length);
+  clearSelection(); poll();
+});
+$("selDelete").addEventListener("click", function () {
+  var list = selectedJobs().filter(function (j) { return j.status !== "processing"; });
+  var skipped = selected.size - list.length;
+  openSheet("Delete " + list.length + (list.length === 1 ? " splat?" : " splats?"),
+    "Removes the splat, thumbnail and job record. Photos in Immich are not touched." +
+    (skipped ? "\n" + skipped + " still processing, kept." : ""),
+    [{label: "Delete " + list.length, cls: "danger", run: async function () {
+      var bad = 0;
+      for (var i = 0; i < list.length; i++) {
+        try { await api("DELETE", "/api/jobs/" + encodeURIComponent(list[i].id)); } catch (e) { bad++; }
+      }
+      closeSheet();
+      toast(bad ? "Deleted " + (list.length - bad) + ", " + bad + " failed" : "Deleted " + list.length);
+      clearSelection(); poll();
+    }}]);
+});
+
 /* ---------- tiles ---------- */
 function makeTile(id) {
   var t = {id: id, sig: "", job: null, sync: null};
@@ -346,13 +564,37 @@ function makeTile(id) {
   ring.appendChild(box); ring.appendChild(lbl);
   var bad = el("div", "badge-err", "!");
   var pill = el("span", "pill");
-  open.appendChild(img); open.appendChild(ring); open.appendChild(bad); open.appendChild(pill);
+  var frame = el("div", "frame");
+  frame.appendChild(img); frame.appendChild(ring); frame.appendChild(bad); frame.appendChild(pill);
+  open.appendChild(frame);
+  var sel = el("button", "sel"); sel.type = "button"; sel.tabIndex = -1;
+  sel.setAttribute("role", "checkbox"); sel.setAttribute("aria-checked", "false");
+  var selIcon = el("span"); selIcon.appendChild(icon("circle")); sel.appendChild(selIcon);
   var menu = el("button", "menu-btn", "⋯"); menu.type = "button";
   var cap = el("div", "cap");
-  root.appendChild(open); root.appendChild(menu); root.appendChild(cap);
-  open.addEventListener("click", function () { onOpen(t.job); });
+  root.appendChild(open); root.appendChild(sel); root.appendChild(menu); root.appendChild(cap);
+  sel.addEventListener("click", function (e) { e.stopPropagation(); toggleSelect(id, e.shiftKey); });
+  open.addEventListener("click", function (e) {
+    if (t.longPressed) { t.longPressed = false; return; }
+    if (selected.size) { toggleSelect(id, e.shiftKey); return; }      // selection mode: tap toggles
+    if ((e.ctrlKey || e.metaKey) && t.job && t.job.viewer_url) { window.open(t.job.viewer_url, "_blank", "noopener"); return; }
+    onOpen(t.job);
+  });
+  open.addEventListener("keydown", function (e) { if (e.key === "x") { e.preventDefault(); toggleSelect(id, e.shiftKey); } });
+  // long press selects on touch screens (Immich's longPress attachment)
+  var lp = null, sx = 0, sy = 0;
+  open.addEventListener("pointerdown", function (e) {
+    if (e.pointerType === "mouse") return;
+    sx = e.clientX; sy = e.clientY;
+    lp = setTimeout(function () { lp = null; t.longPressed = true; toggleSelect(id, false); }, 500);
+  });
+  function cancelLp(e) {
+    if (lp && (!e || e.type !== "pointermove" || Math.hypot(e.clientX - sx, e.clientY - sy) > 10)) { clearTimeout(lp); lp = null; }
+  }
+  ["pointerup", "pointercancel", "pointerleave", "pointermove"].forEach(function (ev) { open.addEventListener(ev, cancelLp); });
+  open.addEventListener("contextmenu", function (e) { if (t.longPressed || lp) e.preventDefault(); });
   menu.addEventListener("click", function (e) { e.stopPropagation(); onMenu(t.job); });
-  Object.assign(t, {el: root, open: open, img: img, ring: ring, arc: arc, pc: pc, lbl: lbl, pill: pill, menu: menu, cap: cap});
+  Object.assign(t, {el: root, open: open, img: img, ring: ring, arc: arc, pc: pc, lbl: lbl, pill: pill, menu: menu, cap: cap, sel: sel, selIcon: selIcon});
   return t;
 }
 
@@ -377,7 +619,8 @@ function updateTile(t, j) {
   t.sig = sig;
 
   var name = j.original_filename || j.asset_id || j.id;
-  t.el.className = "tile " + (isPending(j) ? "pending" : j.status === "error" ? "error" : "done") + (j.thumb_url ? "" : " nothumb");
+  t.el.className = "tile " + (isPending(j) ? "pending" : j.status === "error" ? "error" : "done") + (j.thumb_url ? "" : " nothumb") +
+    (selected.has(j.id) ? " selected" : "");
   if (j.thumb_url && t.img.getAttribute("src") !== j.thumb_url) t.img.setAttribute("src", j.thumb_url);
   t.cap.textContent = name;
   t.cap.title = name;
@@ -389,6 +632,7 @@ function updateTile(t, j) {
   else aria = name + ", processing" + (j.stage ? ", " + j.stage : "");
   t.open.setAttribute("aria-label", aria);
   t.menu.setAttribute("aria-label", "Actions for " + name);
+  t.sel.setAttribute("aria-label", "Select " + name);
 
   t.pill.textContent = j.duration_s != null ? dur(j.duration_s) : "";
   t.pill.style.display = j.status === "done" && j.duration_s != null ? "" : "none";
@@ -447,16 +691,37 @@ function render() {
   tiles.forEach(function (t, id) {
     if (!seen.has(id)) { t.el.remove(); tiles.delete(id); }
   });
-  // place visible tiles in order, moving only what is out of place
-  var grid = $("grid");
-  var want = new Set(list.map(function (j) { return j.id; }));
-  tiles.forEach(function (t, id) { if (!want.has(id) && t.el.parentNode) t.el.remove(); });
-  var cursor = grid.firstElementChild;
+  // group the sorted list (contiguous runs share a group key)
+  var groups = [], byKey = {};
   list.forEach(function (j) {
-    var t = tiles.get(j.id);
-    if (t.el === cursor) cursor = cursor.nextElementSibling;
-    else grid.insertBefore(t.el, cursor);
+    var g = groupOf(j);
+    if (!byKey[g.key]) { byKey[g.key] = {info: g, ids: []}; groups.push(byKey[g.key]); }
+    byKey[g.key].ids.push(j.id);
   });
+  order = [];
+  groups.forEach(function (g) { order = order.concat(g.ids); });
+  var want = new Set(order);
+  tiles.forEach(function (t, id) { if (!want.has(id) && t.el.parentNode) t.el.remove(); });
+  selected.forEach(function (id) { if (!want.has(id)) selected.delete(id); });
+  // place sections, then tiles inside them, moving only what is out of place
+  var box = $("groups"), sc = box.firstElementChild, used = new Set();
+  groups.forEach(function (gr) {
+    var g = sections.get(gr.info.key);
+    if (!g) { g = makeSection(gr.info.key); sections.set(gr.info.key, g); }
+    used.add(gr.info.key);
+    g.ids = gr.ids;
+    g.title.textContent = gr.info.label;
+    if (gr.info.title) g.title.title = gr.info.title; else g.title.removeAttribute("title");
+    if (g.el === sc) sc = sc.nextElementSibling; else box.insertBefore(g.el, sc);
+    var cursor = g.grid.firstElementChild;
+    gr.ids.forEach(function (id) {
+      var t = tiles.get(id);
+      if (t.el === cursor) cursor = cursor.nextElementSibling;
+      else g.grid.insertBefore(t.el, cursor);
+    });
+  });
+  sections.forEach(function (g, key) { if (!used.has(key)) { g.el.remove(); sections.delete(key); } });
+  syncSelection();
 
   var n = jobs.length, shown = list.length;
   $("count").textContent = shown === n ? n + (n === 1 ? " photo" : " photos") : shown + " of " + n;
@@ -506,7 +771,11 @@ function openSheet(title, text, buttons) {
   row.firstChild.focus();
 }
 $("sheetBg").addEventListener("click", function (e) { if (e.target === this) closeSheet(); });
-document.addEventListener("keydown", function (e) { if (e.key === "Escape") closeSheet(); });
+document.addEventListener("keydown", function (e) {
+  if (e.key !== "Escape") return;
+  if ($("sheetBg").classList.contains("show")) closeSheet();
+  else if (selected.size) clearSelection();
+});
 
 function onOpen(j) {
   if (!j) return;

@@ -61,8 +61,12 @@ Open the gallery at `http://<host>:8080`:
 
 - Photos being processed are dimmed with a progress ring; tap a finished one to
   open it in 3D (it starts on the photo's own view; drag to look around).
-- Sort, filter, choose whether splats open in the same or a new tab, retry failed
-  jobs, delete jobs, and see disk/CPU/GPU use.
+- Photos are grouped by day (Today, Yesterday, weekday, date) like Immich's timeline;
+  other sorts group by name initial, size or processing time.
+- Select like in Immich: hover a photo and click its circle (long-press on phones), click a
+  day's circle for the whole day, shift-click for a range, Esc to clear. Then retry or delete
+  them together.
+- Sort, filter, choose whether splats open in the same or a new tab, and see disk/CPU/GPU use.
 
 **From other devices:** the gallery listens on `127.0.0.1` only. Set `APP_BIND=0.0.0.0`
 in `.env` and restart (there is no login, so keep it on your home network), or put it
